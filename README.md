@@ -10,8 +10,8 @@ The node streams camera images and joint states to a remote GPU server running t
 ## System overview
 
 ```
-Robot PC                                GPU Server
-───────────────────────────────         ──────────────────────────────
+Laptop                                           GPU Server
+──────────────────────────────────────           ──────────────────────
  RealSense front  ──┐
  RealSense wrist  ──┤  openpi_client_node         openpi serve
  /joint_states    ──┘   │  packs obs dict    ──►  (pi0.5 model)
@@ -20,8 +20,14 @@ Robot PC                                GPU Server
                          │  [x, y, z, qw, qx, qy, qz, gripper]
                          ▼
                ActionExecutor
-               (MotionPlanningInterface)
-               MoveIt 2 → Franka hardware
+               (MotionPlanningInterface / omni_place)
+                         │  Cartesian goal + gripper cmd
+                         ▼
+                    MoveIt 2 API  (laptop)
+                         │  ROS 2 network
+                         ▼
+               Franka Computer
+               MoveIt 2 + Franka driver → robot hardware
 ```
 
 ---
@@ -124,19 +130,25 @@ python scripts/serve_policy.py \
 
 ### 2. Launch MoveIt 2 on the Franka computer
 
-On the robot PC, using the [franka-vision-guided-manipulation](https://github.com/saifahmadgit/franka-vision-guided-manipulation) workspace:
+On the Franka computer, start the Franka driver + MoveIt 2:
 
 ```bash
 source ~/ros2_ws/install/setup.bash
-ros2 launch omni_place omni_place.launch.py robot_ip:=<ROBOT_IP>
+ros2 launch franka_moveit_config moveit.launch.py robot_ip:=<ROBOT_IP>
 ```
 
-This brings up the Franka driver, MoveIt 2, and the `MotionPlanningInterface` that `ActionExecutor` calls into.
+This is the only thing running on the Franka computer.
 
-### 3. Launch cameras + OpenPI client (Robot PC)
+### 3. Launch cameras + OpenPI client (laptop)
+
+The [franka-vision-guided-manipulation](https://github.com/saifahmadgit/franka-vision-guided-manipulation) MoveIt API nodes and this OpenPI client all run on the **laptop** (make sure it can reach the Franka computer over the network via `ROS_DOMAIN_ID` or appropriate ROS 2 middleware config).
 
 ```bash
-# new terminal — cameras + OpenPI client
+# terminal 1 (laptop) — MoveIt API / motion planning interface
+source ~/ros2_ws/install/setup.bash
+ros2 launch omni_place omni_place.launch.py
+
+# terminal 2 (laptop) — cameras + OpenPI client
 source ~/ros2_ws/install/setup.bash
 ros2 launch franka_openpi openpi_franka.launch.py
 ```
