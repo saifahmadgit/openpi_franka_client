@@ -106,18 +106,37 @@ All parameters are set in `launch/openpi_franka.launch.py`:
 
 ### 1. Start the OpenPI inference server (GPU machine)
 
+Clone and set up [openpi_franka](https://github.com/saifahmadgit/openpi_franka) on the GPU machine, then serve the policy:
+
 ```bash
-# on GPU server
-python scripts/serve_policy.py --env FRANKA_EXAMPLE --host 0.0.0.0 --port 8000
+CUDA_VISIBLE_DEVICES=1 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+python scripts/serve_policy.py \
+  --default_prompt "pick up the apple" \
+  --port 8000 \
+  policy:checkpoint \
+  --policy.config pi05_magicsim_apple_red \
+  --policy.dir checkpoints/pi05_magicsim_apple_red/magicsim_apple_lora_red/55000
 ```
 
-### 2. Launch the full stack (Robot PC)
+- `CUDA_VISIBLE_DEVICES=1` — use GPU index 1 (adjust if needed)
+- `XLA_PYTHON_CLIENT_PREALLOCATE=false` — prevents JAX from grabbing all GPU memory upfront
+- `--policy.dir` — path to the checkpoint directory relative to the repo root
+
+### 2. Launch MoveIt 2 on the Franka computer
+
+On the robot PC, using the [franka-vision-guided-manipulation](https://github.com/saifahmadgit/franka-vision-guided-manipulation) workspace:
 
 ```bash
-# terminal 1 — MoveIt 2 + Franka driver (from franka-vision-guided-manipulation)
-ros2 launch franka_moveit_config moveit.launch.py robot_ip:=<ROBOT_IP>
+source ~/ros2_ws/install/setup.bash
+ros2 launch omni_place omni_place.launch.py robot_ip:=<ROBOT_IP>
+```
 
-# terminal 2 — cameras + OpenPI client
+This brings up the Franka driver, MoveIt 2, and the `MotionPlanningInterface` that `ActionExecutor` calls into.
+
+### 3. Launch cameras + OpenPI client (Robot PC)
+
+```bash
+# new terminal — cameras + OpenPI client
 source ~/ros2_ws/install/setup.bash
 ros2 launch franka_openpi openpi_franka.launch.py
 ```
