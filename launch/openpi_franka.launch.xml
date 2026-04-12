@@ -1,0 +1,25 @@
+<launch>                                
+    <!-- Front RealSense (fixed mount) -->
+    <include file="$(find-pkg-share realsense2_camera)/launch/rs_launch.py">                                                                                        
+      <arg name="serial_no"        value="'938422076824'"/>
+      <arg name="camera_namespace" value="camera/front"/>                                                                                                           
+      <arg name="rgb_camera.color_profile" value="640x480x30"/>                                                                                                     
+      <arg name="depth_module.depth_profile" value="640x480x30"/>                                                                                                   
+    </include>                                                                                                                                                      
+                                                                                                                                                                    
+    <!-- Wrist RealSense -->                                                                                                                                        
+    <include file="$(find-pkg-share realsense2_camera)/launch/rs_launch.py">                                                                                        
+      <arg name="serial_no"        value="'233522075872'"/>                                                                                                      
+      <arg name="camera_namespace" value="camera/wrist"/>
+      <arg name="rgb_camera.color_profile" value="640x480x30"/>
+    </include>                                                                                                                                                      
+                                          
+    <!-- OpenPI client node -->                                                                                                                                     
+    <node pkg="franka_openpi" exec="openpi_client_node" name="openpi_client">                                                                                       
+      <param name="server_host"    value="GPU_SERVER_IP"/>
+      <param name="server_port"    value="8000"/>                                                                                                                   
+      <param name="prompt"         value="pick up the red apple"/>
+      <param name="action_horizon" value="10"/>                                                                                                                     
+      <param name="num_episodes"   value="5"/>                                                                                                                      
+    </node>                                                                                                                                                         
+  </launch>           
