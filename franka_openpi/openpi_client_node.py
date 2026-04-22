@@ -29,6 +29,9 @@ JOINT_ORDER = [
 # [7:9] = panda_finger_joint1, panda_finger_joint2
 STATE_DIM = 9
 
+# Dataset native resolution: (H=480, W=640) — used for all 3 cameras
+IMG_H, IMG_W = 480, 640
+
 
 class OpenPIClientNode(Node):
     def __init__(self):
@@ -47,13 +50,17 @@ class OpenPIClientNode(Node):
         self.action_horizon = self.get_parameter("action_horizon").value
 
         self.bridge = CvBridge()
-        self.front_image = None
+        self.front1_image = None
+        self.front2_image = None
         self.wrist_image = None
         self._raw_joints = np.zeros(STATE_DIM)  # 7 joints + 2 finger joints
 
-        # Camera subscribers
+        # Camera subscribers (3 cameras matching dataset: front_1, front_2, wrist)
         self.create_subscription(
-            Image, "/camera/front/camera/color/image_raw", self._front_cb, 10
+            Image, "/camera/front_1/camera/color/image_raw", self._front1_cb, 10
+        )
+        self.create_subscription(
+            Image, "/camera/front_2/camera/color/image_raw", self._front2_cb, 10
         )
         self.create_subscription(
             Image, "/camera/wrist/camera/color/image_raw", self._wrist_cb, 10
@@ -73,17 +80,20 @@ class OpenPIClientNode(Node):
         self.action_executor = ActionExecutor(self)
 
     # ── callbacks ────────────────────────────────────────────────────────
-    def _front_cb(self, msg):
-        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")             # (480, 640, 3) HWC
-        img = np.ascontiguousarray(img[:, 80:560, :])             # center crop → (480, 480, 3)
-        img = cv2.resize(img, (512, 512))                         # (512, 512, 3) HWC uint8
-        self.front_image = np.ascontiguousarray(img.transpose(2, 0, 1))  # → (3, 512, 512) CHW
+    def _proc_image(self, msg) -> np.ndarray:
+        """Decode and resize to dataset native resolution (3, 480, 640) CHW uint8."""
+        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")          # (H, W, 3) HWC
+        img = cv2.resize(img, (IMG_W, IMG_H))                  # (480, 640, 3) HWC
+        return np.ascontiguousarray(img.transpose(2, 0, 1))    # (3, 480, 640) CHW
+
+    def _front1_cb(self, msg):
+        self.front1_image = self._proc_image(msg)
+
+    def _front2_cb(self, msg):
+        self.front2_image = self._proc_image(msg)
 
     def _wrist_cb(self, msg):
-        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")             # (480, 640, 3) HWC
-        img = np.ascontiguousarray(img[:, 80:560, :])             # center crop → (480, 480, 3)
-        img = cv2.resize(img, (256, 256))                         # (256, 256, 3) HWC uint8
-        self.wrist_image = np.ascontiguousarray(img.transpose(2, 0, 1))  # → (3, 256, 256) CHW
+        self.wrist_image = self._proc_image(msg)
 
     def _joint_cb(self, msg):
         name_to_pos = dict(zip(msg.name, msg.position))
@@ -92,21 +102,18 @@ class OpenPIClientNode(Node):
                 self._raw_joints[i] = name_to_pos[jname]
 
     def _build_state(self) -> np.ndarray:
-        """Pack robot state into the (9,) format the server expects.
-
-        Layout: [panda_joint1-7, panda_finger_joint1, panda_finger_joint2]
-        """
         return self._raw_joints.astype(np.float32)
 
     # ── observation packing ──────────────────────────────────────────────
     def _get_observation(self) -> dict | None:
-        if self.front_image is None or self.wrist_image is None:
+        if self.front1_image is None or self.front2_image is None or self.wrist_image is None:
             return None
         return {
-            "state": self._build_state(),                          # (9,) float32
+            "state": self._build_state(),                           # (9,) float32
             "images": {
-                "cam_high": self.front_image,        # (3, 512, 512) CHW uint8
-                "cam_left_wrist": self.wrist_image,  # (3, 256, 256) CHW uint8
+                "cam_high":       self.front1_image,   # (3, 480, 640) CHW uint8
+                "cam_low":        self.front2_image,   # (3, 480, 640) CHW uint8
+                "cam_left_wrist": self.wrist_image,    # (3, 480, 640) CHW uint8
             },
             "prompt": self.prompt,
         }
@@ -128,10 +135,10 @@ class OpenPIClientNode(Node):
             executor.shutdown(wait=False)
 
     async def _run_async(self, num_episodes: int):
-        # Wait for both cameras (background executor delivers the callbacks)
+        # Wait for all three cameras (background executor delivers the callbacks)
         self.get_logger().info("Waiting for camera images...")
         deadline = asyncio.get_event_loop().time() + 10.0
-        while self.front_image is None or self.wrist_image is None:
+        while self.front1_image is None or self.front2_image is None or self.wrist_image is None:
             if asyncio.get_event_loop().time() > deadline:
                 self.get_logger().error("Cameras not ready after 10 s — check topics")
                 return
@@ -155,8 +162,8 @@ class OpenPIClientNode(Node):
                     f"  Step {step}: executing {len(actions)} waypoints"
                 )
 
-                # actions: (action_horizon, 8) — [x, y, z, qw, qx, qy, qz, gripper]
-                await self.action_executor.execute_eef_poses(actions)
+                # actions: (action_horizon, 8) — [joint_0..6, gripper]
+                await self.action_executor.execute_joint_commands(actions)
 
 
 def main():
