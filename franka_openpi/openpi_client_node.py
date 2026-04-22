@@ -13,21 +13,22 @@ from sensor_msgs.msg import Image, JointState
 from franka_openpi.action_executor import ActionExecutor
 
 JOINT_ORDER = [
-    "panda_joint1",
-    "panda_joint2",
-    "panda_joint3",
-    "panda_joint4",
-    "panda_joint5",
-    "panda_joint6",
-    "panda_joint7",
-    "panda_finger_joint1",
-    "panda_finger_joint2",
+    "fer_joint1",
+    "fer_joint2",
+    "fer_joint3",
+    "fer_joint4",
+    "fer_joint5",
+    "fer_joint6",
+    "fer_joint7",
+    "fer_finger_joint1",
+    "fer_finger_joint2",
 ]
 
 # State layout expected by the server: (9,) float32
 # [0:7] = panda_joint1-7
 # [7:9] = panda_finger_joint1, panda_finger_joint2
-STATE_DIM = 9
+STATE_DIM = 9   # joints read from /joint_states (7 arm + 2 finger)
+STATE_OUT = 7   # policy expects only the 7 arm joint angles
 
 # Dataset native resolution: (H=480, W=640) — used for all 3 cameras
 IMG_H, IMG_W = 480, 640
@@ -81,10 +82,10 @@ class OpenPIClientNode(Node):
 
     # ── callbacks ────────────────────────────────────────────────────────
     def _proc_image(self, msg) -> np.ndarray:
-        """Decode and resize to dataset native resolution (3, 480, 640) CHW uint8."""
+        """Decode and resize to dataset native resolution (480, 640, 3) HWC uint8."""
         img = self.bridge.imgmsg_to_cv2(msg, "rgb8")          # (H, W, 3) HWC
         img = cv2.resize(img, (IMG_W, IMG_H))                  # (480, 640, 3) HWC
-        return np.ascontiguousarray(img.transpose(2, 0, 1))    # (3, 480, 640) CHW
+        return np.ascontiguousarray(img)                       # (480, 640, 3) HWC uint8
 
     def _front1_cb(self, msg):
         self.front1_image = self._proc_image(msg)
@@ -102,18 +103,19 @@ class OpenPIClientNode(Node):
                 self._raw_joints[i] = name_to_pos[jname]
 
     def _build_state(self) -> np.ndarray:
-        return self._raw_joints.astype(np.float32)
+        # Policy expects (7,) — arm joints only, no finger joints
+        return self._raw_joints[:STATE_OUT].astype(np.float32)
 
     # ── observation packing ──────────────────────────────────────────────
     def _get_observation(self) -> dict | None:
         if self.front1_image is None or self.front2_image is None or self.wrist_image is None:
             return None
         return {
-            "state": self._build_state(),                           # (9,) float32
+            "state": self._build_state(),                              # (7,) float32
             "images": {
-                "cam_high":       self.front1_image,   # (3, 480, 640) CHW uint8
-                "cam_low":        self.front2_image,   # (3, 480, 640) CHW uint8
-                "cam_left_wrist": self.wrist_image,    # (3, 480, 640) CHW uint8
+                "cam_high":        self.front1_image,  # (480, 640, 3) HWC uint8 ← front_1
+                "cam_left_wrist":  self.front2_image,  # (480, 640, 3) HWC uint8 ← front_2
+                "cam_right_wrist": self.wrist_image,   # (480, 640, 3) HWC uint8 ← wrist
             },
             "prompt": self.prompt,
         }

@@ -1,17 +1,19 @@
 import numpy as np
+from moveit_msgs.msg import MoveItErrorCodes
 from omni_place.Interface import MotionPlanningInterface
 import rclpy.logging
 
 _log = rclpy.logging.get_logger("action_executor")
 
+# Must match the joint names used in the MoveIt URDF / joint_states topic
 JOINT_NAMES = [
-    "panda_joint1",
-    "panda_joint2",
-    "panda_joint3",
-    "panda_joint4",
-    "panda_joint5",
-    "panda_joint6",
-    "panda_joint7",
+    "fer_joint1",
+    "fer_joint2",
+    "fer_joint3",
+    "fer_joint4",
+    "fer_joint5",
+    "fer_joint6",
+    "fer_joint7",
 ]
 
 
@@ -21,30 +23,40 @@ class ActionExecutor:
 
     async def execute_joint_commands(self, actions: np.ndarray) -> bool:
         """
-        Execute a batch of joint position commands from openpi output.
+        Execute a batch of absolute joint position commands from openpi output.
         actions: (action_horizon, 8) — [joint_0..6, gripper]
 
         Uses the final waypoint of the chunk as the joint target.
         """
-        # ── log all action steps to see the full chunk ────────────────────
+        # log all steps so the full chunk is visible in the log
         for i, a in enumerate(actions):
             joints_str = ", ".join(f"j{j}={a[j]:.4f}" for j in range(7))
             _log.info(f"  action[{i}] {joints_str}  grip={a[7]:.3f}")
 
         goal = actions[-1]
-        joint_positions = [float(goal[j]) for j in range(7)]
+        # plan_path_joint expects dict[str, float]
+        goal_joint = {name: float(goal[j]) for j, name in enumerate(JOINT_NAMES)}
         gripper_cmd = float(goal[7])
 
         _log.info(
             "sending joint target: "
-            + ", ".join(f"{n}={p:.4f}" for n, p in zip(JOINT_NAMES, joint_positions))
+            + ", ".join(f"{n}={p:.4f}" for n, p in goal_joint.items())
         )
 
-        result = await self.interface.plan_to_joint_target(
-            joint_positions=joint_positions,
+        result = await self.interface.plan_path_joint(
+            goal_joint=goal_joint,
             execute=True,
+            save=False,
         )
-        _log.info(f"plan_to_joint_target returned: {result}")
+
+        success = (
+            result is not None
+            and result.error_code.val == MoveItErrorCodes.SUCCESS
+        )
+        _log.info(
+            f"plan_path_joint {'succeeded' if success else 'FAILED'} "
+            f"(code={result.error_code.val if result is not None else 'None'})"
+        )
 
         _log.info(f"gripper cmd: {gripper_cmd:.3f} → {'CLOSE' if gripper_cmd > 0.5 else 'OPEN'}")
         if gripper_cmd > 0.5:
@@ -52,4 +64,4 @@ class ActionExecutor:
         else:
             await self.interface.set_gripper_franka(width=0.08, speed=0.1, adaptive_stop=False)
 
-        return result is not None
+        return success

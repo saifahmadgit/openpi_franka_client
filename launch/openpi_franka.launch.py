@@ -23,17 +23,35 @@ def generate_launch_description():
             value=[_VENV_SITE + ':', EnvironmentVariable('PYTHONPATH', default_value='')],
         ),
 
-        # ── Front RealSense (fixed mount) ────────────────────────────────────
+        # ── Front RealSense 1 ─────────────────────────────────────────────────
         # serial_no must be ParameterValue(value_type=str) — the XML/launch
         # YAML writer converts bare numeric strings to integers, which the node
         # rejects because it already declared serial_no as a string parameter.
         Node(
             package='realsense2_camera',
-            namespace='camera/front',
+            namespace='camera/front_1',
             name='camera',
             executable='realsense2_camera_node',
             parameters=[{
                 'serial_no': ParameterValue('938422076824', value_type=str),
+                'rgb_camera.color_profile': '640x480x30',
+                'enable_depth': False,
+                'enable_infra1': False,
+                'enable_infra2': False,
+                'enable_gyro': False,
+                'enable_accel': False,
+            }],
+            output='screen',
+        ),
+
+        # ── Front RealSense 2 ─────────────────────────────────────────────────
+        Node(
+            package='realsense2_camera',
+            namespace='camera/front_2',
+            name='camera',
+            executable='realsense2_camera_node',
+            parameters=[{
+                'serial_no': ParameterValue('XXXXXXXXXXXX', value_type=str),  # TODO: replace with real serial
                 'rgb_camera.color_profile': '640x480x30',
                 'enable_depth': False,
                 'enable_infra1': False,
