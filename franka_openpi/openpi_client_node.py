@@ -1,16 +1,51 @@
 import asyncio
+import logging
+import time
 import threading
+from typing import Dict, Tuple
 
 import cv2
 import numpy as np
 import rclpy
+import websockets.sync.client
 from cv_bridge import CvBridge
-from openpi_client import websocket_client_policy
+from openpi_client import msgpack_numpy, websocket_client_policy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 
 from franka_openpi.action_executor import ActionExecutor
+
+
+class _NoPingPolicy(websocket_client_policy.WebsocketClientPolicy):
+    """WebsocketClientPolicy with keepalive pings disabled.
+
+    The default 20 s ping timeout fires during inference when the model
+    takes longer than expected (3 cameras + new joint model).
+    """
+
+    def _wait_for_server(self) -> Tuple[websockets.sync.client.ClientConnection, Dict]:
+        logging.info(f"Waiting for server at {self._uri}...")
+        while True:
+            try:
+                headers = (
+                    {"Authorization": f"Api-Key {self._api_key}"}
+                    if self._api_key
+                    else None
+                )
+                conn = websockets.sync.client.connect(
+                    self._uri,
+                    compression=None,
+                    max_size=None,
+                    additional_headers=headers,
+                    ping_interval=None,  # disable keepalive pings
+                    ping_timeout=None,
+                )
+                metadata = msgpack_numpy.unpackb(conn.recv())
+                return conn, metadata
+            except ConnectionRefusedError:
+                logging.info("Still waiting for server...")
+                time.sleep(5)
 
 JOINT_ORDER = [
     "fer_joint1",
@@ -72,9 +107,7 @@ class OpenPIClientNode(Node):
 
         # OpenPI server connection
         self.get_logger().info(f"Connecting to openpi server at {host}:{port}")
-        self.policy = websocket_client_policy.WebsocketClientPolicy(
-            host=host, port=port
-        )
+        self.policy = _NoPingPolicy(host=host, port=port)
         self.get_logger().info("Connected.")
 
         # Motion executor
@@ -82,10 +115,14 @@ class OpenPIClientNode(Node):
 
     # ── callbacks ────────────────────────────────────────────────────────
     def _proc_image(self, msg) -> np.ndarray:
-        """Decode and resize to dataset native resolution (480, 640, 3) HWC uint8."""
-        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")          # (H, W, 3) HWC
-        img = cv2.resize(img, (IMG_W, IMG_H))                  # (480, 640, 3) HWC
-        return np.ascontiguousarray(img)                       # (480, 640, 3) HWC uint8
+        """Decode to CHW uint8 — same format the old 2-camera code used.
+
+        The server's _parse_image() applies moveaxis(0, -1) to convert CHW→HWC.
+        uint8 CHW is 4x smaller than float32 CHW, keeping WebSocket latency low.
+        """
+        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")              # (H, W, 3) HWC uint8
+        img = cv2.resize(img, (IMG_W, IMG_H))                      # (480, 640, 3) HWC uint8
+        return np.ascontiguousarray(img.transpose(2, 0, 1))        # (3, 480, 640) CHW uint8
 
     def _front1_cb(self, msg):
         self.front1_image = self._proc_image(msg)
@@ -113,9 +150,9 @@ class OpenPIClientNode(Node):
         return {
             "state": self._build_state(),                              # (7,) float32
             "images": {
-                "cam_high":        self.front1_image,  # (480, 640, 3) HWC uint8 ← front_1
-                "cam_left_wrist":  self.front2_image,  # (480, 640, 3) HWC uint8 ← front_2
-                "cam_right_wrist": self.wrist_image,   # (480, 640, 3) HWC uint8 ← wrist
+                "cam_high":        self.front1_image,  # (3, 480, 640) CHW uint8 ← front_1
+                "cam_left_wrist":  self.front2_image,  # (3, 480, 640) CHW uint8 ← front_2
+                "cam_right_wrist": self.wrist_image,   # (3, 480, 640) CHW uint8 ← wrist
             },
             "prompt": self.prompt,
         }
@@ -134,7 +171,7 @@ class OpenPIClientNode(Node):
         try:
             asyncio.run(self._run_async(num_episodes))
         finally:
-            executor.shutdown(wait=False)
+            executor.shutdown()
 
     async def _run_async(self, num_episodes: int):
         # Wait for all three cameras (background executor delivers the callbacks)

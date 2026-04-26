@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/openpi_franka.launch.xml',
             'launch/openpi_franka.launch.py',
+            'launch/act_franka.launch.py',
         ]),
     ],
     install_requires=['setuptools'],
@@ -29,6 +30,7 @@ setup(
     entry_points={
         'console_scripts': [
             'openpi_client_node = franka_openpi.openpi_client_node:main',
+            'act_client_node = franka_openpi.act_client_node:main',
             'hand_eye_calibrate = franka_openpi.hand_eye_calibrate:main',
         ],
     },
