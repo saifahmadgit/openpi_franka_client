@@ -25,14 +25,13 @@ JOINT_ORDER = [
     "fer_finger_joint2",
 ]
 
-STATE_DIM = 9   # 7 arm + 2 finger joints read from /joint_states
-STATE_OUT = 7   # only arm joints sent in state
+STATE_DIM = 9
+STATE_OUT = 7
 IMG_H, IMG_W = 480, 640
 
 
 def _encode_image(chw_uint8: np.ndarray) -> str:
-    """CHW uint8 RGB → HWC → PNG bytes → base64 string."""
-    hwc = chw_uint8.transpose(1, 2, 0)  # still RGB — PIL reads PNG as RGB
+    hwc = chw_uint8.transpose(1, 2, 0)
     ok, buf = cv2.imencode(".png", hwc)
     if not ok:
         raise RuntimeError("PNG encode failed")
@@ -45,10 +44,13 @@ class ACTClientNode(Node):
 
         self.declare_parameter("server_host", "192.168.1.X")
         self.declare_parameter("server_port", 8001)
+        self.declare_parameter("action_horizon", 10)
         self.declare_parameter("num_episodes", 5)
 
         host = self.get_parameter("server_host").value
         port = self.get_parameter("server_port").value
+        self.action_horizon = self.get_parameter("action_horizon").value
+
         self.infer_url = f"http://{host}:{port}/infer"
         self.reset_url = f"http://{host}:{port}/reset"
 
@@ -75,7 +77,7 @@ class ACTClientNode(Node):
     def _proc_image(self, msg) -> np.ndarray:
         img = self.bridge.imgmsg_to_cv2(msg, "rgb8")
         img = cv2.resize(img, (IMG_W, IMG_H))
-        return np.ascontiguousarray(img.transpose(2, 0, 1))  # (3,480,640) CHW uint8
+        return np.ascontiguousarray(img.transpose(2, 0, 1))
 
     def _front1_cb(self, msg): self.front1_image = self._proc_image(msg)
     def _front2_cb(self, msg): self.front2_image = self._proc_image(msg)
@@ -98,6 +100,18 @@ class ACTClientNode(Node):
                 "cam_right_wrist": _encode_image(self.wrist_image),
             },
         }
+
+    def _fetch_chunk(self, loop) -> np.ndarray | None:
+        payload = self._build_payload()
+        if payload is None:
+            return None
+        try:
+            resp = requests.post(self.infer_url, json=payload, timeout=30)
+            resp.raise_for_status()
+            return np.array(resp.json()["actions"])  # (100, 8)
+        except Exception as e:
+            self.get_logger().error(f"Infer request failed: {e}")
+            return None
 
     def _post_reset(self):
         try:
@@ -132,26 +146,23 @@ class ACTClientNode(Node):
             self.get_logger().info(f"Episode {ep + 1}/{num_episodes}")
             self._post_reset()
 
+            chunk = None
+
             for step in range(500):
-                payload = self._build_payload()
-                if payload is None:
-                    await asyncio.sleep(0.05)
-                    continue
-
-                try:
-                    resp = await loop.run_in_executor(
-                        None,
-                        lambda p=payload: requests.post(self.infer_url, json=p, timeout=30),
+                # Re-query every action_horizon steps (same pattern as ActionChunkBroker)
+                if step % self.action_horizon == 0:
+                    new_chunk = await loop.run_in_executor(
+                        None, lambda: self._fetch_chunk(loop)
                     )
-                    resp.raise_for_status()
-                    result = resp.json()
-                except Exception as e:
-                    self.get_logger().error(f"Infer request failed: {e}")
-                    continue
+                    if new_chunk is not None:
+                        chunk = new_chunk
+                    elif chunk is None:
+                        self.get_logger().error("No chunk available, skipping step.")
+                        continue
 
-                actions = np.array(result["actions"])  # (1, 8)
-                self.get_logger().info(f"  Step {step}: action = {actions[-1]}")
-                await self.action_executor.execute_joint_commands(actions)
+                action = chunk[step % self.action_horizon]  # (8,)
+                self.get_logger().info(f"  Step {step}: action = {action}")
+                await self.action_executor.execute_action(action)
 
 
 def main():

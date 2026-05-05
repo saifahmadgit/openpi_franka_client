@@ -48,7 +48,7 @@ def generate_launch_description():
                         "serial_no": ParameterValue(
                             "342522070195", value_type=str
                         ),  # right base camera (robot POV)
-                        "rgb_camera.color_profile": "640x480x30",
+                        "rgb_camera.color_profile": "1280x720x30",
                         "enable_depth": False,
                         "enable_infra1": False,
                         "enable_infra2": False,
@@ -69,7 +69,7 @@ def generate_launch_description():
                         "serial_no": ParameterValue(
                             "233522075872", value_type=str
                         ),  # left base camera (robot POV)
-                        "rgb_camera.color_profile": "640x480x30",
+                        "rgb_camera.color_profile": "1280x720x30",
                         "enable_depth": False,
                         "enable_infra1": False,
                         "enable_infra2": False,
@@ -90,7 +90,7 @@ def generate_launch_description():
                         "serial_no": ParameterValue(
                             "938422076824", value_type=str
                         ),  # wrist camera
-                        "rgb_camera.color_profile": "640x480x30",
+                        "rgb_camera.color_profile": "1280x720x30",
                         "enable_depth": False,
                         "enable_infra1": False,
                         "enable_infra2": False,
@@ -98,6 +98,13 @@ def generate_launch_description():
                         "enable_accel": False,
                     }
                 ],
+                output="screen",
+            ),
+            # ── Camera viewer ─────────────────────────────────────────────────────
+            Node(
+                package="franka_openpi",
+                executable="camera_viewer",
+                name="camera_viewer",
                 output="screen",
             ),
             # ── OpenPI client node ────────────────────────────────────────────────

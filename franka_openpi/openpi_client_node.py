@@ -9,7 +9,7 @@ import numpy as np
 import rclpy
 import websockets.sync.client
 from cv_bridge import CvBridge
-from openpi_client import msgpack_numpy, websocket_client_policy
+from openpi_client import action_chunk_broker, msgpack_numpy, websocket_client_policy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
@@ -65,8 +65,7 @@ JOINT_ORDER = [
 STATE_DIM = 9   # joints read from /joint_states (7 arm + 2 finger)
 STATE_OUT = 7   # policy expects only the 7 arm joint angles
 
-# Dataset native resolution: (H=480, W=640) — used for all 3 cameras
-IMG_H, IMG_W = 480, 640
+# All cameras stream at native resolution; server resize_with_pad handles any input size.
 
 
 class OpenPIClientNode(Node):
@@ -107,7 +106,10 @@ class OpenPIClientNode(Node):
 
         # OpenPI server connection
         self.get_logger().info(f"Connecting to openpi server at {host}:{port}")
-        self.policy = _NoPingPolicy(host=host, port=port)
+        self.policy = action_chunk_broker.ActionChunkBroker(
+            _NoPingPolicy(host=host, port=port),
+            action_horizon=self.action_horizon,
+        )
         self.get_logger().info("Connected.")
 
         # Motion executor
@@ -115,14 +117,9 @@ class OpenPIClientNode(Node):
 
     # ── callbacks ────────────────────────────────────────────────────────
     def _proc_image(self, msg) -> np.ndarray:
-        """Decode to CHW uint8 — same format the old 2-camera code used.
-
-        The server's _parse_image() applies moveaxis(0, -1) to convert CHW→HWC.
-        uint8 CHW is 4x smaller than float32 CHW, keeping WebSocket latency low.
-        """
-        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")              # (H, W, 3) HWC uint8
-        img = cv2.resize(img, (IMG_W, IMG_H))                      # (480, 640, 3) HWC uint8
-        return np.ascontiguousarray(img.transpose(2, 0, 1))        # (3, 480, 640) CHW uint8
+        """Decode to CHW uint8. Server resize_with_pad(224, 224) handles any input size."""
+        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")
+        return np.ascontiguousarray(img.transpose(2, 0, 1))
 
     def _front1_cb(self, msg):
         self.front1_image = self._proc_image(msg)
@@ -193,16 +190,13 @@ class OpenPIClientNode(Node):
                     await asyncio.sleep(0.05)
                     continue
 
-                # Query server → (action_horizon, 8)
+                # Broker returns one action at a time; re-queries server every action_horizon steps
                 result = self.policy.infer(obs)
-                actions = np.array(result["actions"])  # (action_horizon, 8)
+                action = np.array(result["actions"])  # (8,)
 
-                self.get_logger().info(
-                    f"  Step {step}: executing {len(actions)} waypoints"
-                )
+                self.get_logger().info(f"  Step {step}: action = {action}")
 
-                # actions: (action_horizon, 8) — [joint_0..6, gripper]
-                await self.action_executor.execute_joint_commands(actions)
+                await self.action_executor.execute_joint_commands(action[np.newaxis])
 
 
 def main():

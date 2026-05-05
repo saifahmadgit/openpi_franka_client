@@ -32,6 +32,7 @@ setup(
             'openpi_client_node = franka_openpi.openpi_client_node:main',
             'act_client_node = franka_openpi.act_client_node:main',
             'hand_eye_calibrate = franka_openpi.hand_eye_calibrate:main',
+            'camera_viewer = franka_openpi.camera_viewer:main',
         ],
     },
 )

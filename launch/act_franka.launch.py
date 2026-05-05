@@ -63,6 +63,13 @@ def generate_launch_description():
                 ],
                 output="screen",
             ),
+            # ── Camera viewer ─────────────────────────────────────────────────────
+            Node(
+                package="franka_openpi",
+                executable="camera_viewer",
+                name="camera_viewer",
+                output="screen",
+            ),
             # ── ACT client node ───────────────────────────────────────────────────
             Node(
                 package="franka_openpi",
@@ -70,7 +77,7 @@ def generate_launch_description():
                 name="act_client",
                 parameters=[
                     {
-                        "server_host": "129.105.69.11",  # GPU machine IP — update if changed
+                        "server_host": "129.105.69.10",  # GPU machine IP — update if changed
                         "server_port": 8001,
                         "num_episodes": 5,
                     }
