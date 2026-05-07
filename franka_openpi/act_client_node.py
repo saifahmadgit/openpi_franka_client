@@ -3,6 +3,7 @@ import base64
 import threading
 
 import cv2
+import matplotlib.pyplot as plt
 import numpy as np
 import requests
 import rclpy
@@ -120,6 +121,31 @@ class ACTClientNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Reset request failed: {e}")
 
+    def _plot_debug(self, ep: int, commanded: list, actual: list):
+        if not commanded or not actual:
+            return
+        n = min(len(commanded), len(actual))
+        cmd = np.array(commanded[:n])   # (n, 7)
+        act = np.array(actual[:n])      # (n, 7)
+        chunks = np.arange(n)
+
+        joint_labels = [f"j{i+1}" for i in range(7)]
+        fig, axes = plt.subplots(7, 1, figsize=(12, 14), sharex=True)
+        fig.suptitle(f"Episode {ep} — Commanded (chunk[-1]) vs Actual (after chunk)", fontsize=12)
+
+        for j, ax in enumerate(axes):
+            ax.plot(chunks, cmd[:, j], "b-o", markersize=3, label="commanded")
+            ax.plot(chunks, act[:, j], "r-o", markersize=3, label="actual")
+            ax.set_ylabel(joint_labels[j] + " (rad)")
+            ax.legend(loc="upper right", fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+        axes[-1].set_xlabel("chunk index")
+        plt.tight_layout()
+        plt.savefig(f"/tmp/act_debug_ep{ep}.png", dpi=120)
+        self.get_logger().info(f"Debug plot saved → /tmp/act_debug_ep{ep}.png")
+        plt.show()
+
     def run(self, num_episodes: int = 1):
         executor = MultiThreadedExecutor()
         executor.add_node(self)
@@ -147,22 +173,32 @@ class ACTClientNode(Node):
             self._post_reset()
 
             chunk = None
+            # per-chunk debug: (chunk_idx, joint) → value
+            commanded_log = []   # chunk[action_horizon-1][:7] at query time
+            actual_log    = []   # _raw_joints[:7] after chunk completes
 
             for step in range(500):
-                # Re-query every action_horizon steps (same pattern as ActionChunkBroker)
                 if step % self.action_horizon == 0:
                     new_chunk = await loop.run_in_executor(
                         None, lambda: self._fetch_chunk(loop)
                     )
                     if new_chunk is not None:
                         chunk = new_chunk
+                        # record last commanded action of this chunk
+                        commanded_log.append(chunk[self.action_horizon - 1][:7].copy())
                     elif chunk is None:
                         self.get_logger().error("No chunk available, skipping step.")
                         continue
 
                 action = chunk[step % self.action_horizon]  # (8,)
                 self.get_logger().info(f"  Step {step}: action = {action}")
-                await self.action_executor.execute_action(action)
+                await self.action_executor.execute_joint_commands(action[np.newaxis])
+
+                # after last step of a chunk, record actual robot state
+                if (step + 1) % self.action_horizon == 0:
+                    actual_log.append(self._raw_joints[:7].copy())
+
+            self._plot_debug(ep + 1, commanded_log, actual_log)
 
 
 def main():

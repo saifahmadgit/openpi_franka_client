@@ -78,11 +78,13 @@ class OpenPIClientNode(Node):
         self.declare_parameter("prompt", "pick up the red apple")
         self.declare_parameter("action_horizon", 10)
         self.declare_parameter("num_episodes", 5)
+        self.declare_parameter("step_dt", 0.1)
 
         host = self.get_parameter("server_host").value
         port = self.get_parameter("server_port").value
         self.prompt = self.get_parameter("prompt").value
         self.action_horizon = self.get_parameter("action_horizon").value
+        self.step_dt = self.get_parameter("step_dt").value
 
         self.bridge = CvBridge()
         self.front1_image = None

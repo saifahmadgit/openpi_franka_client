@@ -58,3 +58,11 @@ class ActionExecutor:
             await self.interface.set_gripper_franka(width=0.08, speed=0.1, adaptive_stop=False)
 
         return success
+
+    async def execute_joint_commands(self, actions: np.ndarray) -> bool:
+        """
+        Execute the last action in a (N, 8) array: [joint_0..6, gripper].
+        Matches the OpenPI call pattern: execute_joint_commands(action[np.newaxis]).
+        """
+        action = actions[-1]
+        return await self.execute_action(action)
