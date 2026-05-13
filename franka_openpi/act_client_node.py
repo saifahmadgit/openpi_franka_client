@@ -35,8 +35,8 @@ IMG_H, IMG_W = 480, 640
 
 
 def _encode_image(chw_uint8: np.ndarray) -> str:
-    hwc = chw_uint8.transpose(1, 2, 0)
-    ok, buf = cv2.imencode(".png", hwc)
+    hwc = chw_uint8.transpose(1, 2, 0)  # still RGB at this point
+    ok, buf = cv2.imencode(".png", hwc[:, :, ::-1])  # RGB→BGR so cv2 writes correct RGB PNG
     if not ok:
         raise RuntimeError("PNG encode failed")
     return base64.b64encode(buf.tobytes()).decode("utf-8")
@@ -101,7 +101,7 @@ class ACTClientNode(Node):
         if self.front1_image is None or self.front2_image is None or self.wrist_image is None:
             return None
         return {
-            "state": self._raw_joints[:STATE_OUT].tolist(),
+            "state": self._raw_joints[:STATE_DIM].tolist(),
             "images": {
                 "cam_high":        _encode_image(self.front1_image),
                 "cam_left_wrist":  _encode_image(self.front2_image),
