@@ -1,8 +1,11 @@
 import asyncio
 import base64
+import os
 import threading
 
 import cv2
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import requests
@@ -73,6 +76,10 @@ class ACTClientNode(Node):
         self.create_subscription(JointState, "/joint_states", self._joint_cb, 10)
 
         self.action_executor = ActionExecutor(self)
+        self.commanded_log = []
+        self.actual_log = []
+        self._debug_dir = os.path.expanduser("~/Franka/src/franka_openpi/debug")
+        os.makedirs(self._debug_dir, exist_ok=True)
         self.get_logger().info(f"ACT client ready → {self.infer_url}")
 
     def _proc_image(self, msg) -> np.ndarray:
@@ -121,30 +128,41 @@ class ACTClientNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Reset request failed: {e}")
 
-    def _plot_debug(self, ep: int, commanded: list, actual: list):
-        if not commanded or not actual:
-            return
-        n = min(len(commanded), len(actual))
-        cmd = np.array(commanded[:n])   # (n, 7)
-        act = np.array(actual[:n])      # (n, 7)
-        chunks = np.arange(n)
+    def _plot_debug(self):
+        try:
+            self._plot_debug_inner()
+        except Exception as e:
+            print(f"[ACT] Plot failed: {e}")
 
-        joint_labels = [f"j{i+1}" for i in range(7)]
-        fig, axes = plt.subplots(7, 1, figsize=(12, 14), sharex=True)
-        fig.suptitle(f"Episode {ep} — Commanded (chunk[-1]) vs Actual (after chunk)", fontsize=12)
+    def _plot_debug_inner(self):
+        if not self.commanded_log or not self.actual_log:
+            return
+        cmd = np.array(self.commanded_log)   # (N, 7)
+        act = np.array(self.actual_log)       # (N, 7)
+        n = min(len(cmd), len(act))
+        if n == 0:
+            return
+        cmd = cmd[:n]
+        act = act[:n]
+        steps = np.arange(n)
+
+        joint_labels = [f"Joint {i + 1}" for i in range(7)]
+        fig, axes = plt.subplots(7, 1, figsize=(16, 18), sharex=True)
+        fig.suptitle(f"Policy Command vs Robot State — {n} steps", fontsize=13)
 
         for j, ax in enumerate(axes):
-            ax.plot(chunks, cmd[:, j], "b-o", markersize=3, label="commanded")
-            ax.plot(chunks, act[:, j], "r-o", markersize=3, label="actual")
-            ax.set_ylabel(joint_labels[j] + " (rad)")
+            ax.scatter(steps, cmd[:, j], color="steelblue", s=10, label="commanded (policy)")
+            ax.scatter(steps, act[:, j], color="tomato",    s=10, label="actual (robot state)")
+            ax.set_ylabel(joint_labels[j] + "\n(rad)", fontsize=8)
             ax.legend(loc="upper right", fontsize=7)
             ax.grid(True, alpha=0.3)
 
-        axes[-1].set_xlabel("chunk index")
+        axes[-1].set_xlabel("step")
         plt.tight_layout()
-        plt.savefig(f"/tmp/act_debug_ep{ep}.png", dpi=120)
-        self.get_logger().info(f"Debug plot saved → /tmp/act_debug_ep{ep}.png")
-        plt.show()
+        path = os.path.join(self._debug_dir, "act_debug.png")
+        plt.savefig(path, dpi=150)
+        plt.close(fig)
+        print(f"[ACT] Debug plot saved → {path}")
 
     def run(self, num_episodes: int = 1):
         executor = MultiThreadedExecutor()
@@ -155,50 +173,62 @@ class ACTClientNode(Node):
             asyncio.run(self._run_async(num_episodes))
         finally:
             executor.shutdown()
+            self._plot_debug()
 
     async def _run_async(self, num_episodes: int):
-        self.get_logger().info("Waiting for camera images...")
+        print("Waiting for camera images...")
         deadline = asyncio.get_event_loop().time() + 10.0
         while self.front1_image is None or self.front2_image is None or self.wrist_image is None:
             if asyncio.get_event_loop().time() > deadline:
-                self.get_logger().error("Cameras not ready after 10 s — check topics")
+                print("ERROR: Cameras not ready after 10 s — check topics")
                 return
             await asyncio.sleep(0.1)
-        self.get_logger().info("Cameras ready.")
+        print("Cameras ready.")
 
         loop = asyncio.get_event_loop()
 
+        # Clear any results from a previous run
+        import os
+        for fname in ("commanded.npy", "actual.npy", "act_debug.png"):
+            p = os.path.join(self._debug_dir, fname)
+            if os.path.exists(p):
+                os.remove(p)
+        self.commanded_log.clear()
+        self.actual_log.clear()
+
         for ep in range(num_episodes):
-            self.get_logger().info(f"Episode {ep + 1}/{num_episodes}")
+            print(f"\n{'='*50}")
+            print(f"  Episode {ep + 1} / {num_episodes}")
+            print(f"{'='*50}")
             self._post_reset()
 
-            chunk = None
-            # per-chunk debug: (chunk_idx, joint) → value
-            commanded_log = []   # chunk[action_horizon-1][:7] at query time
-            actual_log    = []   # _raw_joints[:7] after chunk completes
+            total_steps = 0
+            chunk_num = 0
+            while total_steps < 500:
+                # 1. Query
+                chunk_num += 1
+                print(f"\n  [Chunk {chunk_num}] Querying server...")
+                chunk = await loop.run_in_executor(None, lambda: self._fetch_chunk(loop))
+                if chunk is None:
+                    print(f"  [Chunk {chunk_num}] ERROR: fetch failed — stopping episode.")
+                    break
+                print(f"  [Chunk {chunk_num}] Received {len(chunk)} actions")
 
-            for step in range(500):
-                if step % self.action_horizon == 0:
-                    new_chunk = await loop.run_in_executor(
-                        None, lambda: self._fetch_chunk(loop)
-                    )
-                    if new_chunk is not None:
-                        chunk = new_chunk
-                        # record last commanded action of this chunk
-                        commanded_log.append(chunk[self.action_horizon - 1][:7].copy())
-                    elif chunk is None:
-                        self.get_logger().error("No chunk available, skipping step.")
-                        continue
+                # 2. Execute all actions in chunk, record per step
+                for i, action in enumerate(chunk):
+                    print(f"    Executing {i + 1} of {len(chunk)}  (chunk {chunk_num})", end="\r")
+                    await self.action_executor.execute_joint_commands(action[np.newaxis])
+                    self.commanded_log.append(action[:7].copy())
+                    self.actual_log.append(self._raw_joints[:7].copy())
+                    total_steps += 1
+                    np.save(os.path.join(self._debug_dir, "commanded.npy"), np.array(self.commanded_log))
+                    np.save(os.path.join(self._debug_dir, "actual.npy"),    np.array(self.actual_log))
+                    if total_steps >= 500:
+                        break
 
-                action = chunk[step % self.action_horizon]  # (8,)
-                self.get_logger().info(f"  Step {step}: action = {action}")
-                await self.action_executor.execute_joint_commands(action[np.newaxis])
-
-                # after last step of a chunk, record actual robot state
-                if (step + 1) % self.action_horizon == 0:
-                    actual_log.append(self._raw_joints[:7].copy())
-
-            self._plot_debug(ep + 1, commanded_log, actual_log)
+                print(f"    Executing {min(i + 1, len(chunk))} of {len(chunk)}  (chunk {chunk_num}) — done")
+                self._plot_debug()
+                # 3. Loop back → query again
 
 
 def main():

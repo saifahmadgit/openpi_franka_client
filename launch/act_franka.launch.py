@@ -83,6 +83,8 @@ def generate_launch_description():
                     }
                 ],
                 output="screen",
+                emulate_tty=True,
+                ros_arguments=["--log-level", "WARN"],
             ),
         ]
     )
