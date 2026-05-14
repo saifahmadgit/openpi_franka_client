@@ -14,7 +14,7 @@ def generate_launch_description():
                 executable="realsense2_camera_node",
                 parameters=[
                     {
-                        "serial_no": ParameterValue("342522070195", value_type=str),
+                        "serial_no": ParameterValue("233522075872", value_type=str),
                         "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
@@ -33,7 +33,7 @@ def generate_launch_description():
                 executable="realsense2_camera_node",
                 parameters=[
                     {
-                        "serial_no": ParameterValue("233522075872", value_type=str),
+                        "serial_no": ParameterValue("342522070195", value_type=str),
                         "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
