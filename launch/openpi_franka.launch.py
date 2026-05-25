@@ -1,8 +1,8 @@
 import os
 
 from launch import LaunchDescription
-from launch.actions import SetEnvironmentVariable
-from launch.substitutions import EnvironmentVariable
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -26,6 +26,21 @@ _VENV_SITE = os.path.normpath(_VENV_SITE)
 def generate_launch_description():
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "exec_horizon",
+                default_value="0",
+                description="Actions to execute per chunk (0 = full chunk)",
+            ),
+            DeclareLaunchArgument(
+                "num_episodes",
+                default_value="5",
+                description="Number of episodes to run",
+            ),
+            DeclareLaunchArgument(
+                "prompt",
+                default_value="pick up the orange cylinder",
+                description="Task prompt for the policy",
+            ),
             # Prepend venv site-packages so /usr/bin/python3 can import openpi_client.
             SetEnvironmentVariable(
                 name="PYTHONPATH",
@@ -48,7 +63,7 @@ def generate_launch_description():
                         "serial_no": ParameterValue(
                             "342522070195", value_type=str
                         ),  # right base camera (robot POV)
-                        "rgb_camera.color_profile": "1280x720x30",
+                        "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
                         "enable_infra2": False,
@@ -69,7 +84,7 @@ def generate_launch_description():
                         "serial_no": ParameterValue(
                             "233522075872", value_type=str
                         ),  # left base camera (robot POV)
-                        "rgb_camera.color_profile": "1280x720x30",
+                        "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
                         "enable_infra2": False,
@@ -88,9 +103,9 @@ def generate_launch_description():
                 parameters=[
                     {
                         "serial_no": ParameterValue(
-                            "938422076824", value_type=str
+                            "347622076595", value_type=str
                         ),  # wrist camera
-                        "rgb_camera.color_profile": "1280x720x30",
+                        "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
                         "enable_infra2": False,
@@ -116,9 +131,9 @@ def generate_launch_description():
                     {
                         "server_host": "129.105.69.11",
                         "server_port": 8000,
-                        "prompt": "pick up the red apple",
-                        "action_horizon": 10,
-                        "num_episodes": 5,
+                        "prompt": LaunchConfiguration("prompt"),
+                        "num_episodes": LaunchConfiguration("num_episodes"),
+                        "exec_horizon": LaunchConfiguration("exec_horizon"),
                     }
                 ],
             ),

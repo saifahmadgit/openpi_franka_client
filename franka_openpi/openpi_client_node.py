@@ -1,20 +1,23 @@
 import asyncio
 import logging
+import os
 import time
 import threading
 from typing import Dict, Tuple
 
-import cv2
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import rclpy
 import websockets.sync.client
 from cv_bridge import CvBridge
-from openpi_client import action_chunk_broker, msgpack_numpy, websocket_client_policy
+from openpi_client import msgpack_numpy, websocket_client_policy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 
-from franka_openpi.action_executor import ActionExecutor
+from franka_openpi.action_executor import ActionExecutor, STEP_DURATION
 
 
 class _NoPingPolicy(websocket_client_policy.WebsocketClientPolicy):
@@ -47,6 +50,7 @@ class _NoPingPolicy(websocket_client_policy.WebsocketClientPolicy):
                 logging.info("Still waiting for server...")
                 time.sleep(5)
 
+
 JOINT_ORDER = [
     "fer_joint1",
     "fer_joint2",
@@ -59,40 +63,31 @@ JOINT_ORDER = [
     "fer_finger_joint2",
 ]
 
-# State layout expected by the server: (9,) float32
-# [0:7] = panda_joint1-7
-# [7:9] = panda_finger_joint1, panda_finger_joint2
 STATE_DIM = 9   # joints read from /joint_states (7 arm + 2 finger)
-STATE_OUT = 7   # policy expects only the 7 arm joint angles
-
-# All cameras stream at native resolution; server resize_with_pad handles any input size.
+STATE_OUT = 8   # policy expects 7 arm joints + 1 gripper (fer_finger_joint1)
 
 
 class OpenPIClientNode(Node):
     def __init__(self):
         super().__init__("openpi_client")
 
-        # Parameters
-        self.declare_parameter("server_host", "192.168.1.X")  # GPU server IP
+        self.declare_parameter("server_host", "192.168.1.X")
         self.declare_parameter("server_port", 8000)
-        self.declare_parameter("prompt", "pick up the red apple")
-        self.declare_parameter("action_horizon", 10)
+        self.declare_parameter("prompt", "pick up the orange cylinder")
         self.declare_parameter("num_episodes", 5)
-        self.declare_parameter("step_dt", 0.1)
+        self.declare_parameter("exec_horizon", 0)  # 0 = execute full chunk
 
         host = self.get_parameter("server_host").value
         port = self.get_parameter("server_port").value
         self.prompt = self.get_parameter("prompt").value
-        self.action_horizon = self.get_parameter("action_horizon").value
-        self.step_dt = self.get_parameter("step_dt").value
+        self.exec_horizon = self.get_parameter("exec_horizon").value
 
         self.bridge = CvBridge()
         self.front1_image = None
         self.front2_image = None
         self.wrist_image = None
-        self._raw_joints = np.zeros(STATE_DIM)  # 7 joints + 2 finger joints
+        self._raw_joints = np.zeros(STATE_DIM)
 
-        # Camera subscribers (3 cameras matching dataset: front_1, front_2, wrist)
         self.create_subscription(
             Image, "/camera/front_1/camera/color/image_raw", self._front1_cb, 10
         )
@@ -102,26 +97,24 @@ class OpenPIClientNode(Node):
         self.create_subscription(
             Image, "/camera/wrist/camera/color/image_raw", self._wrist_cb, 10
         )
-
-        # Joint state subscriber
         self.create_subscription(JointState, "/joint_states", self._joint_cb, 10)
 
-        # OpenPI server connection
         self.get_logger().info(f"Connecting to openpi server at {host}:{port}")
-        self.policy = action_chunk_broker.ActionChunkBroker(
-            _NoPingPolicy(host=host, port=port),
-            action_horizon=self.action_horizon,
-        )
+        self.policy = _NoPingPolicy(host=host, port=port)
         self.get_logger().info("Connected.")
 
-        # Motion executor
         self.action_executor = ActionExecutor(self)
+        self.commanded_log = []
+        self.actual_log = []
+        self.chunk_sizes_log = []
+        self._debug_dir = os.path.expanduser("~/Franka/src/franka_openpi/debug")
+        os.makedirs(self._debug_dir, exist_ok=True)
 
     # ── callbacks ────────────────────────────────────────────────────────
+
     def _proc_image(self, msg) -> np.ndarray:
-        """Decode to CHW uint8. Server resize_with_pad(224, 224) handles any input size."""
         img = self.bridge.imgmsg_to_cv2(msg, "rgb8")
-        return np.ascontiguousarray(img.transpose(2, 0, 1))
+        return np.ascontiguousarray(img.transpose(2, 0, 1))  # CHW (3, 480, 640)
 
     def _front1_cb(self, msg):
         self.front1_image = self._proc_image(msg)
@@ -138,67 +131,160 @@ class OpenPIClientNode(Node):
             if jname in name_to_pos:
                 self._raw_joints[i] = name_to_pos[jname]
 
-    def _build_state(self) -> np.ndarray:
-        # Policy expects (7,) — arm joints only, no finger joints
-        return self._raw_joints[:STATE_OUT].astype(np.float32)
+    # ── observation / inference ──────────────────────────────────────────
 
-    # ── observation packing ──────────────────────────────────────────────
     def _get_observation(self) -> dict | None:
         if self.front1_image is None or self.front2_image is None or self.wrist_image is None:
             return None
         return {
-            "state": self._build_state(),                              # (7,) float32
+            "state": self._raw_joints[:STATE_OUT].astype(np.float32),
             "images": {
-                "cam_high":        self.front1_image,  # (3, 480, 640) CHW uint8 ← front_1
-                "cam_left_wrist":  self.front2_image,  # (3, 480, 640) CHW uint8 ← front_2
-                "cam_right_wrist": self.wrist_image,   # (3, 480, 640) CHW uint8 ← wrist
+                "cam_high":        self.front1_image,
+                "cam_left_wrist":  self.front2_image,
+                "cam_right_wrist": self.wrist_image,
             },
             "prompt": self.prompt,
         }
 
-    # ── main inference loop ──────────────────────────────────────────────
+    def _fetch_chunk_sync(self) -> np.ndarray | None:
+        obs = self._get_observation()
+        if obs is None:
+            return None
+        try:
+            result = self.policy.infer(obs)
+            return np.array(result["actions"])  # (chunk_size, 8) — Pi0.5 default: 50
+        except Exception as e:
+            self.get_logger().error(f"Infer request failed: {e}")
+            return None
+
+    # ── debug logging / plotting ─────────────────────────────────────────
+
+    def _init_episode_logs(self):
+        for fname in ("commanded.npy", "actual.npy", "chunks.npy", "openpi_debug.png"):
+            p = os.path.join(self._debug_dir, fname)
+            if os.path.exists(p):
+                os.remove(p)
+        self.commanded_log.clear()
+        self.actual_log.clear()
+        self.chunk_sizes_log.clear()
+
+    def _save_logs(self):
+        np.save(os.path.join(self._debug_dir, "commanded.npy"), np.array(self.commanded_log))
+        np.save(os.path.join(self._debug_dir, "actual.npy"),    np.array(self.actual_log))
+        np.save(os.path.join(self._debug_dir, "chunks.npy"),    np.array(self.chunk_sizes_log))
+        if len(self.commanded_log) % 50 == 0:
+            self._plot_debug()
+
+    def _plot_debug(self):
+        try:
+            if not self.commanded_log or not self.actual_log:
+                return
+            cmd = np.array(self.commanded_log)
+            act = np.array(self.actual_log)
+            n = min(len(cmd), len(act))
+            if n == 0:
+                return
+            cmd, act = cmd[:n], act[:n]
+            steps = np.arange(n)
+
+            fig, axes = plt.subplots(7, 1, figsize=(16, 18), sharex=True)
+            fig.suptitle(f"Policy Command vs Robot State — {n} steps", fontsize=13)
+            for j, ax in enumerate(axes):
+                ax.scatter(steps, cmd[:, j], color="steelblue", s=10, label="commanded (policy)")
+                ax.scatter(steps, act[:, j], color="tomato",    s=10, label="actual (robot state)")
+                ax.set_ylabel(f"Joint {j + 1}\n(rad)", fontsize=8)
+                ax.legend(loc="upper right", fontsize=7)
+                ax.grid(True, alpha=0.3)
+            axes[-1].set_xlabel("step")
+            plt.tight_layout()
+            path = os.path.join(self._debug_dir, "openpi_debug.png")
+            plt.savefig(path, dpi=150)
+            plt.close(fig)
+            print(f"[OpenPI] Debug plot saved → {path}")
+        except Exception as e:
+            print(f"[OpenPI] Plot failed: {e}")
+
+    async def _sample_actual(self, n: int) -> list:
+        """Sample actual joint state once per policy step during chunk execution."""
+        samples = []
+        for _ in range(n):
+            await asyncio.sleep(STEP_DURATION)
+            samples.append(self._raw_joints[:7].copy())
+        return samples
+
+    # ── main loop ────────────────────────────────────────────────────────
+
     def run(self, num_episodes: int = 1):
-        """
-        Spin rclpy in a background thread so ROS futures resolve while the
-        asyncio event loop runs the inference + motion loop on the main thread.
-        """
         executor = MultiThreadedExecutor()
         executor.add_node(self)
         spin_thread = threading.Thread(target=executor.spin, daemon=True)
         spin_thread.start()
-
         try:
             asyncio.run(self._run_async(num_episodes))
         finally:
             executor.shutdown()
+            self._plot_debug()
 
     async def _run_async(self, num_episodes: int):
-        # Wait for all three cameras (background executor delivers the callbacks)
+        loop = asyncio.get_event_loop()
+
+        self.get_logger().info("Waiting for action servers...")
+        ok = await loop.run_in_executor(
+            None, lambda: self.action_executor.wait_for_servers(timeout_sec=15.0)
+        )
+        if not ok:
+            return
+
         self.get_logger().info("Waiting for camera images...")
-        deadline = asyncio.get_event_loop().time() + 10.0
+        deadline = loop.time() + 10.0
         while self.front1_image is None or self.front2_image is None or self.wrist_image is None:
-            if asyncio.get_event_loop().time() > deadline:
+            if loop.time() > deadline:
                 self.get_logger().error("Cameras not ready after 10 s — check topics")
                 return
             await asyncio.sleep(0.1)
         self.get_logger().info("Cameras ready.")
 
+        self._init_episode_logs()
+
         for ep in range(num_episodes):
-            self.get_logger().info(f"Episode {ep + 1}/{num_episodes}")
+            print(f"\n{'='*50}")
+            print(f"  Episode {ep + 1} / {num_episodes}")
+            print(f"{'='*50}")
 
-            for step in range(500):
-                obs = self._get_observation()
-                if obs is None:
-                    await asyncio.sleep(0.05)
-                    continue
+            step = 0
+            while step < 500:
+                # 1. Query policy from true current robot state
+                print(f"  Querying policy at step {step}...")
+                chunk = await loop.run_in_executor(None, self._fetch_chunk_sync)
+                if chunk is None:
+                    print("  ERROR: inference failed — stopping episode.")
+                    break
 
-                # Broker returns one action at a time; re-queries server every action_horizon steps
-                result = self.policy.infer(obs)
-                action = np.array(result["actions"])  # (8,)
+                horizon = self.exec_horizon if self.exec_horizon > 0 else len(chunk)
+                n = min(horizon, len(chunk), 500 - step)
+                chunk = chunk[:n]
+                print(f"  Executing {n} actions...")
+                self.chunk_sizes_log.append(n)
 
-                self.get_logger().info(f"  Step {step}: action = {action}")
+                for action in chunk:
+                    self.commanded_log.append(action[:7].copy())
 
-                await self.action_executor.execute_joint_commands(action[np.newaxis])
+                # 2. Execute chunk and sample actual state in parallel at STEP_DURATION rate
+                exec_task = asyncio.create_task(self.action_executor.execute_chunk(chunk))
+                actual_samples = await self._sample_actual(n)
+                ok = await exec_task
+
+                for s in actual_samples:
+                    self.actual_log.append(s)
+                self._save_logs()
+
+                step += n
+                if not ok:
+                    print("  WARNING: trajectory did not complete successfully.")
+                    break
+
+            self._plot_debug()
+            print(f"  Episode {ep + 1} done ({step} steps).")
 
 
 def main():
