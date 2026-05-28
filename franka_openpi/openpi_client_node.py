@@ -187,14 +187,22 @@ class OpenPIClientNode(Node):
             cmd, act = cmd[:n], act[:n]
             steps = np.arange(n)
 
-            fig, axes = plt.subplots(7, 1, figsize=(16, 18), sharex=True)
+            from franka_openpi.action_executor import GRIPPER_CLOSE_THRESHOLD
+            fig, axes = plt.subplots(8, 1, figsize=(16, 20), sharex=True)
             fig.suptitle(f"Policy Command vs Robot State — {n} steps", fontsize=13)
-            for j, ax in enumerate(axes):
+            for j, ax in enumerate(axes[:7]):
                 ax.scatter(steps, cmd[:, j], color="steelblue", s=10, label="commanded (policy)")
                 ax.scatter(steps, act[:, j], color="tomato",    s=10, label="actual (robot state)")
                 ax.set_ylabel(f"Joint {j + 1}\n(rad)", fontsize=8)
                 ax.legend(loc="upper right", fontsize=7)
                 ax.grid(True, alpha=0.3)
+            ax_g = axes[7]
+            ax_g.scatter(steps, cmd[:, 7], color="steelblue", s=10, label="commanded (policy)")
+            ax_g.scatter(steps, act[:, 7], color="tomato",    s=10, label="actual (finger joint)")
+            ax_g.axhline(GRIPPER_CLOSE_THRESHOLD, color="orange", linewidth=1, linestyle="--", label=f"close threshold ({GRIPPER_CLOSE_THRESHOLD})")
+            ax_g.set_ylabel("Gripper\n(m)", fontsize=8)
+            ax_g.legend(loc="upper right", fontsize=7)
+            ax_g.grid(True, alpha=0.3)
             axes[-1].set_xlabel("step")
             plt.tight_layout()
             path = os.path.join(self._debug_dir, "openpi_debug.png")
@@ -209,7 +217,7 @@ class OpenPIClientNode(Node):
         samples = []
         for _ in range(n):
             await asyncio.sleep(STEP_DURATION)
-            samples.append(self._raw_joints[:7].copy())
+            samples.append(self._raw_joints[:8].copy())
         return samples
 
     # ── main loop ────────────────────────────────────────────────────────
@@ -267,7 +275,7 @@ class OpenPIClientNode(Node):
                 self.chunk_sizes_log.append(n)
 
                 for action in chunk:
-                    self.commanded_log.append(action[:7].copy())
+                    self.commanded_log.append(action[:8].copy())
 
                 # 2. Execute chunk and sample actual state in parallel at STEP_DURATION rate
                 exec_task = asyncio.create_task(self.action_executor.execute_chunk(chunk))

@@ -21,8 +21,8 @@ JOINT_NAMES = [
     "fer_joint7",
 ]
 
-GRIPPER_CLOSE_THRESHOLD = 0.02
-STEP_DURATION = 0.1  # seconds per policy step — sets trajectory timing
+GRIPPER_CLOSE_THRESHOLD = 0.033
+STEP_DURATION = 0.05  # seconds per policy step — sets trajectory timing
 
 
 class ActionExecutor:
@@ -34,6 +34,7 @@ class ActionExecutor:
         self._gripper_grasp = ActionClient(node, Grasp, "/fer_gripper/grasp")
         self._interface = MotionPlanningInterface(node)
         self._gripper_is_open: bool | None = None
+        self._gripper_task: asyncio.Task | None = None
 
     def wait_for_servers(self, timeout_sec: float = 15.0) -> bool:
         if not self._follow_jt.wait_for_server(timeout_sec=timeout_sec):
@@ -48,12 +49,18 @@ class ActionExecutor:
             )
         else:
             await self._interface.set_gripper_franka(
-                width=0.0, speed=0.05, adaptive_stop=True
+                width=0.03, speed=0.05, adaptive_stop=True
             )
 
-    async def _send_gripper_delayed(self, open_gripper: bool, delay: float):
-        await asyncio.sleep(delay)
-        await self._send_gripper(open_gripper)
+    async def _run_gripper_transitions(self, transitions: list[tuple[float, bool]]):
+        """Execute gripper transitions in order, serialized, timed from chunk start."""
+        t0 = asyncio.get_event_loop().time()
+        for delay, open_gripper in transitions:
+            wait = delay - (asyncio.get_event_loop().time() - t0)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            _log.info(f"gripper → {'OPEN' if open_gripper else 'CLOSE'}")
+            await self._send_gripper(open_gripper)
 
     async def execute_chunk(self, chunk: np.ndarray) -> bool:
         """Send the full chunk as one FollowJointTrajectory goal and await completion."""
@@ -80,15 +87,22 @@ class ActionExecutor:
             _log.error("Trajectory goal rejected by controller")
             return False
 
-        # Schedule gripper transitions timed to their position within the chunk
+        # Collect all gripper transitions, then run them serialized in one task
+        transitions = []
+        last_state = self._gripper_is_open
         for i, action in enumerate(chunk):
             gripper_open = float(action[7]) >= GRIPPER_CLOSE_THRESHOLD
-            if gripper_open != self._gripper_is_open:
-                self._gripper_is_open = gripper_open
-                _log.info(f"gripper → {'OPEN' if gripper_open else 'CLOSE'} at step {i}")
-                asyncio.create_task(
-                    self._send_gripper_delayed(gripper_open, i * STEP_DURATION)
-                )
+            if gripper_open != last_state:
+                transitions.append((i * STEP_DURATION, gripper_open))
+                last_state = gripper_open
+        if transitions:
+            self._gripper_is_open = last_state
+            # Cancel any still-running gripper task from the previous chunk
+            if self._gripper_task and not self._gripper_task.done():
+                self._gripper_task.cancel()
+            self._gripper_task = asyncio.create_task(
+                self._run_gripper_transitions(transitions)
+            )
 
         # Bridge rclpy result future → asyncio future and wait
         result_aio: asyncio.Future = loop.create_future()
