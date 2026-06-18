@@ -6,30 +6,29 @@ from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
-# Ensure openpi_client (installed in the project venv) is visible to the
-# system-Python ROS node executable.
-_VENV_SITE = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "..",
-    "..",
-    "..",
-    "..",
-    ".venv",
-    "lib",
-    "python3.12",
-    "site-packages",
+_VENV_SITE = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "..",
+        "..",
+        "..",
+        ".venv",
+        "lib",
+        "python3.12",
+        "site-packages",
+    )
 )
-_VENV_SITE = os.path.normpath(_VENV_SITE)
 
 
 def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument(
-                "exec_horizon",
-                default_value="0",
-                description="Actions to execute per chunk (0 = full chunk)",
+                "prompt",
+                default_value="pick up the orange cylinder",
+                description="Task instruction for the policy",
             ),
             DeclareLaunchArgument(
                 "num_episodes",
@@ -37,11 +36,10 @@ def generate_launch_description():
                 description="Number of episodes to run",
             ),
             DeclareLaunchArgument(
-                "prompt",
-                default_value="pick up the red object",
-                description="Task prompt for the policy",
+                "exec_horizon",
+                default_value="0",
+                description="Actions to execute per chunk (0 = full chunk)",
             ),
-            # Prepend venv site-packages so /usr/bin/python3 can import openpi_client.
             SetEnvironmentVariable(
                 name="PYTHONPATH",
                 value=[
@@ -50,9 +48,6 @@ def generate_launch_description():
                 ],
             ),
             # ── Front RealSense 1 ─────────────────────────────────────────────────
-            # serial_no must be ParameterValue(value_type=str) — the XML/launch
-            # YAML writer converts bare numeric strings to integers, which the node
-            # rejects because it already declared serial_no as a string parameter.
             Node(
                 package="realsense2_camera",
                 namespace="camera/front_1",
@@ -60,9 +55,7 @@ def generate_launch_description():
                 executable="realsense2_camera_node",
                 parameters=[
                     {
-                        "serial_no": ParameterValue(
-                            "342522070195", value_type=str
-                        ),  # right base camera (robot POV)
+                        "serial_no": ParameterValue("342522070195", value_type=str),
                         "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
@@ -81,9 +74,7 @@ def generate_launch_description():
                 executable="realsense2_camera_node",
                 parameters=[
                     {
-                        "serial_no": ParameterValue(
-                            "233522075872", value_type=str
-                        ),  # left base camera (robot POV)
+                        "serial_no": ParameterValue("233522075872", value_type=str),
                         "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
@@ -102,9 +93,7 @@ def generate_launch_description():
                 executable="realsense2_camera_node",
                 parameters=[
                     {
-                        "serial_no": ParameterValue(
-                            "347622076595", value_type=str
-                        ),  # wrist camera
+                        "serial_no": ParameterValue("347622076595", value_type=str),
                         "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
@@ -122,20 +111,23 @@ def generate_launch_description():
                 name="camera_viewer",
                 output="screen",
             ),
-            # ── OpenPI client node ────────────────────────────────────────────────
+            # ── Groot client node ─────────────────────────────────────────────────
             Node(
                 package="franka_openpi",
-                executable="openpi_client_node",
-                name="openpi_client",
+                executable="groot_client_node",
+                name="groot_client",
                 parameters=[
                     {
-                        "server_host": "129.105.69.11",
-                        "server_port": 8000,
+                        "server_host": "129.105.69.10",
+                        "server_port": 5555,
                         "prompt": LaunchConfiguration("prompt"),
                         "num_episodes": LaunchConfiguration("num_episodes"),
                         "exec_horizon": LaunchConfiguration("exec_horizon"),
+                        "image_h": 224,
+                        "image_w": 224,
                     }
                 ],
+                output="screen",
             ),
         ]
     )

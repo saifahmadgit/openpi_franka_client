@@ -38,20 +38,21 @@ class CameraViewer(Node):
         self.frames[key] = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
     def render(self):
-        if any(f is None for f in self.frames.values()):
+        if all(f is None for f in self.frames.values()):
             return
         panel_w = DISPLAY_W // 3
         panels = []
         for k in ["front_1", "front_2", "wrist"]:
             frame = self.frames[k]
-            h, w = frame.shape[:2]
-            scale = min(panel_w / w, DISPLAY_H / h)
-            new_w, new_h = int(w * scale), int(h * scale)
-            resized = cv2.resize(frame, (new_w, new_h))
             panel = np.zeros((DISPLAY_H, panel_w, 3), dtype=np.uint8)
-            y = (DISPLAY_H - new_h) // 2
-            x = (panel_w - new_w) // 2
-            panel[y:y + new_h, x:x + new_w] = resized
+            if frame is not None:
+                h, w = frame.shape[:2]
+                scale = min(panel_w / w, DISPLAY_H / h)
+                new_w, new_h = int(w * scale), int(h * scale)
+                resized = cv2.resize(frame, (new_w, new_h))
+                y = (DISPLAY_H - new_h) // 2
+                x = (panel_w - new_w) // 2
+                panel[y:y + new_h, x:x + new_w] = resized
             panels.append(panel)
         row = np.hstack(panels)
         for i, label in enumerate(["front_1", "front_2", "wrist"]):
