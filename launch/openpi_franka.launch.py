@@ -2,6 +2,7 @@ import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.conditions import IfCondition
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -41,6 +42,11 @@ def generate_launch_description():
                 default_value="pick up the red object",
                 description="Task prompt for the policy",
             ),
+            DeclareLaunchArgument(
+                "two_front_cameras",
+                default_value="true",
+                description="Launch both front_1 and front_2 cameras (true) or only front_1 (false, matches 2-cam recorded data)",
+            ),
             # Prepend venv site-packages so /usr/bin/python3 can import openpi_client.
             SetEnvironmentVariable(
                 name="PYTHONPATH",
@@ -61,8 +67,8 @@ def generate_launch_description():
                 parameters=[
                     {
                         "serial_no": ParameterValue(
-                            "342522070195", value_type=str
-                        ),  # right base camera (robot POV)
+                            "938422076779", value_type=str
+                        ),  # dataset front_1 → server key cam_left_wrist (real_grasp_teleop.yaml)
                         "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
@@ -73,7 +79,7 @@ def generate_launch_description():
                 ],
                 output="screen",
             ),
-            # ── Front RealSense 2 ─────────────────────────────────────────────────
+            # ── Front RealSense 2 (skipped when two_front_cameras:=false) ─────────
             Node(
                 package="realsense2_camera",
                 namespace="camera/front_2",
@@ -82,8 +88,8 @@ def generate_launch_description():
                 parameters=[
                     {
                         "serial_no": ParameterValue(
-                            "233522075872", value_type=str
-                        ),  # left base camera (robot POV)
+                            "342522070195", value_type=str
+                        ),  # dataset front_2 → server key cam_right_wrist (real_grasp_teleop.yaml)
                         "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
@@ -93,6 +99,7 @@ def generate_launch_description():
                     }
                 ],
                 output="screen",
+                condition=IfCondition(LaunchConfiguration("two_front_cameras")),
             ),
             # ── Wrist RealSense ───────────────────────────────────────────────────
             Node(
@@ -104,7 +111,7 @@ def generate_launch_description():
                     {
                         "serial_no": ParameterValue(
                             "347622076595", value_type=str
-                        ),  # wrist camera
+                        ),  # dataset wrist → server key cam_high (mandatory base_0_rgb)
                         "rgb_camera.color_profile": "640x480x30",
                         "enable_depth": False,
                         "enable_infra1": False,
@@ -134,6 +141,7 @@ def generate_launch_description():
                         "prompt": LaunchConfiguration("prompt"),
                         "num_episodes": LaunchConfiguration("num_episodes"),
                         "exec_horizon": LaunchConfiguration("exec_horizon"),
+                        "two_front_cameras": LaunchConfiguration("two_front_cameras"),
                     }
                 ],
             ),

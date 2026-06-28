@@ -64,7 +64,10 @@ JOINT_ORDER = [
 ]
 
 STATE_DIM = 9   # joints read from /joint_states (7 arm + 2 finger)
-STATE_OUT = 8   # policy expects 7 arm joints + 1 gripper (fer_finger_joint1)
+# Policy expects the full 9-dim state [j1..j7, finger_joint1, finger_joint2].
+# The checkpoint's norm_stats are 9-dim; sending 8 mis-aligns normalization
+# (the gripper value would be normalized against arm-joint-7's stats).
+STATE_OUT = 9
 
 
 class OpenPIClientNode(Node):
@@ -76,28 +79,34 @@ class OpenPIClientNode(Node):
         self.declare_parameter("prompt", "pick up the orange cylinder")
         self.declare_parameter("num_episodes", 5)
         self.declare_parameter("exec_horizon", 0)  # 0 = execute full chunk
+        self.declare_parameter("two_front_cameras", True)
 
         host = self.get_parameter("server_host").value
         port = self.get_parameter("server_port").value
         self.prompt = self.get_parameter("prompt").value
         self.exec_horizon = self.get_parameter("exec_horizon").value
+        self._two_front_cameras: bool = bool(self.get_parameter("two_front_cameras").value)
 
         self.bridge = CvBridge()
         self.front1_image = None
-        self.front2_image = None
+        self.front2_image = None  # stays None (unused) in 1-front-camera mode
         self.wrist_image = None
         self._raw_joints = np.zeros(STATE_DIM)
 
         self.create_subscription(
             Image, "/camera/front_1/camera/color/image_raw", self._front1_cb, 10
         )
-        self.create_subscription(
-            Image, "/camera/front_2/camera/color/image_raw", self._front2_cb, 10
-        )
+        if self._two_front_cameras:
+            self.create_subscription(
+                Image, "/camera/front_2/camera/color/image_raw", self._front2_cb, 10
+            )
         self.create_subscription(
             Image, "/camera/wrist/camera/color/image_raw", self._wrist_cb, 10
         )
         self.create_subscription(JointState, "/joint_states", self._joint_cb, 10)
+
+        cam_mode = "3-camera (front_1 + front_2 + wrist)" if self._two_front_cameras else "2-camera (front_1 + wrist)"
+        self.get_logger().info(f"Camera mode: {cam_mode}")
 
         self.get_logger().info(f"Connecting to openpi server at {host}:{port}")
         self.policy = _NoPingPolicy(host=host, port=port)
@@ -134,15 +143,33 @@ class OpenPIClientNode(Node):
     # ── observation / inference ──────────────────────────────────────────
 
     def _get_observation(self) -> dict | None:
-        if self.front1_image is None or self.front2_image is None or self.wrist_image is None:
+        if self.front1_image is None or self.wrist_image is None:
             return None
+        if self._two_front_cameras and self.front2_image is None:
+            return None
+        if self._two_front_cameras:
+            # 3-cam server key ← dataset source mapping (how training filled the keys):
+            #   cam_high        ← wrist    (mandatory base_0_rgb)
+            #   cam_left_wrist  ← front_1
+            #   cam_right_wrist ← front_2
+            # repack_transforms run only at training time, so the client must
+            # populate these keys itself to match. Do NOT "fix" by name.
+            images: dict = {
+                "cam_high":        self.wrist_image,
+                "cam_left_wrist":  self.front1_image,
+                "cam_right_wrist": self.front2_image,
+            }
+        else:
+            # 2-cam: front_1→cam_high, wrist→cam_left_wrist
+            # Training used cam_left_wrist for the second camera; cam_right_wrist was always
+            # black/masked. Sending wrist as cam_right_wrist would feed it into the wrong slot.
+            images = {
+                "cam_high":       self.front1_image,
+                "cam_left_wrist": self.wrist_image,
+            }
         return {
             "state": self._raw_joints[:STATE_OUT].astype(np.float32),
-            "images": {
-                "cam_high":        self.front1_image,
-                "cam_left_wrist":  self.front2_image,
-                "cam_right_wrist": self.wrist_image,
-            },
+            "images": images,
             "prompt": self.prompt,
         }
 
@@ -152,7 +179,9 @@ class OpenPIClientNode(Node):
             return None
         try:
             result = self.policy.infer(obs)
-            return np.array(result["actions"])  # (chunk_size, 8) — Pi0.5 default: 50
+            # Server returns (16, 14); columns 8-13 are padding from the bimanual Aloha
+            # default. Only the first 8 are meaningful: 7 arm joints + 1 gripper.
+            return np.array(result["actions"])[:, :8]
         except Exception as e:
             self.get_logger().error(f"Infer request failed: {e}")
             return None
@@ -245,7 +274,11 @@ class OpenPIClientNode(Node):
 
         self.get_logger().info("Waiting for camera images...")
         deadline = loop.time() + 10.0
-        while self.front1_image is None or self.front2_image is None or self.wrist_image is None:
+        while (
+            self.front1_image is None
+            or (self._two_front_cameras and self.front2_image is None)
+            or self.wrist_image is None
+        ):
             if loop.time() > deadline:
                 self.get_logger().error("Cameras not ready after 10 s — check topics")
                 return

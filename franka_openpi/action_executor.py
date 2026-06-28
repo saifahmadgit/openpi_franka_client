@@ -22,7 +22,10 @@ JOINT_NAMES = [
 ]
 
 GRIPPER_CLOSE_THRESHOLD = 0.03
-STEP_DURATION = 0.05  # seconds per policy step — sets trajectory timing
+STEP_DURATION = 1.0 / 30  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
+# Actions are delta-based internally (re-integrated by AbsoluteActions), so consecutive
+# targets are spaced assuming the 30 Hz training rate. Executing slower (e.g. 20 Hz)
+# stretches every motion to >1x its trained duration and drifts the re-query cadence.
 
 # ── Gripper mode ──────────────────────────────────────────────────────────────
 # "binary"     — threshold-based open/close transitions (existing behaviour)
@@ -56,8 +59,11 @@ class ActionExecutor:
                 width=0.08, speed=0.1, adaptive_stop=False
             )
         else:
+            # Binary close: clean Move to 1 cm. adaptive_stop=False so it actually
+            # reaches the target — adaptive_stop activates for width<=0.01 and cancels
+            # the move on any stall, which stops it short of closing.
             await self._interface.set_gripper_franka(
-                width=0.03, speed=0.05, adaptive_stop=True
+                width=0.01, speed=0.05, adaptive_stop=False
             )
 
     async def _run_gripper_transitions(self, transitions: list[tuple[float, bool]]):
