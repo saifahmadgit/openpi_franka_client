@@ -17,7 +17,12 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 
-from franka_openpi.action_executor import ActionExecutor, STEP_DURATION
+from franka_openpi.action_executor import (
+    ActionExecutor,
+    STEP_DURATION,
+    STEP_DURATION_FIRST,
+    STEP_DURATION_REST,
+)
 
 
 class _NoPingPolicy(websocket_client_policy.WebsocketClientPolicy):
@@ -80,12 +85,17 @@ class OpenPIClientNode(Node):
         self.declare_parameter("num_episodes", 5)
         self.declare_parameter("exec_horizon", 0)  # 0 = execute full chunk
         self.declare_parameter("two_front_cameras", True)
+        self.declare_parameter("debug_tag", "")  # filename prefix for debug outputs (e.g. "sim")
 
         host = self.get_parameter("server_host").value
         port = self.get_parameter("server_port").value
         self.prompt = self.get_parameter("prompt").value
         self.exec_horizon = self.get_parameter("exec_horizon").value
         self._two_front_cameras: bool = bool(self.get_parameter("two_front_cameras").value)
+        # Prefix so sim and real runs write to distinct files and a stale plot
+        # from one can't masquerade as the other's output.
+        tag = self.get_parameter("debug_tag").value
+        self._debug_prefix = f"{tag}_" if tag else ""
 
         self.bridge = CvBridge()
         self.front1_image = None
@@ -190,7 +200,7 @@ class OpenPIClientNode(Node):
 
     def _init_episode_logs(self):
         for fname in ("commanded.npy", "actual.npy", "chunks.npy", "openpi_debug.png"):
-            p = os.path.join(self._debug_dir, fname)
+            p = os.path.join(self._debug_dir, self._debug_prefix + fname)
             if os.path.exists(p):
                 os.remove(p)
         self.commanded_log.clear()
@@ -198,11 +208,13 @@ class OpenPIClientNode(Node):
         self.chunk_sizes_log.clear()
 
     def _save_logs(self):
-        np.save(os.path.join(self._debug_dir, "commanded.npy"), np.array(self.commanded_log))
-        np.save(os.path.join(self._debug_dir, "actual.npy"),    np.array(self.actual_log))
-        np.save(os.path.join(self._debug_dir, "chunks.npy"),    np.array(self.chunk_sizes_log))
-        if len(self.commanded_log) % 50 == 0:
-            self._plot_debug()
+        np.save(os.path.join(self._debug_dir, self._debug_prefix + "commanded.npy"), np.array(self.commanded_log))
+        np.save(os.path.join(self._debug_dir, self._debug_prefix + "actual.npy"),    np.array(self.actual_log))
+        np.save(os.path.join(self._debug_dir, self._debug_prefix + "chunks.npy"),    np.array(self.chunk_sizes_log))
+        # Refresh the plot after every chunk. The old `% 50` gate assumed 50-step
+        # chunks and never fired for small exec_horizon values (e.g. 10 → 10,20,30
+        # never hits a multiple of 50), so no plot appeared until an episode ended.
+        self._plot_debug()
 
     def _plot_debug(self):
         try:
@@ -234,18 +246,18 @@ class OpenPIClientNode(Node):
             ax_g.grid(True, alpha=0.3)
             axes[-1].set_xlabel("step")
             plt.tight_layout()
-            path = os.path.join(self._debug_dir, "openpi_debug.png")
+            path = os.path.join(self._debug_dir, self._debug_prefix + "openpi_debug.png")
             plt.savefig(path, dpi=150)
             plt.close(fig)
             print(f"[OpenPI] Debug plot saved → {path}")
         except Exception as e:
             print(f"[OpenPI] Plot failed: {e}")
 
-    async def _sample_actual(self, n: int) -> list:
+    async def _sample_actual(self, n: int, step_duration: float = STEP_DURATION) -> list:
         """Sample actual joint state once per policy step during chunk execution."""
         samples = []
         for _ in range(n):
-            await asyncio.sleep(STEP_DURATION)
+            await asyncio.sleep(step_duration)
             samples.append(self._raw_joints[:8].copy())
         return samples
 
@@ -310,9 +322,12 @@ class OpenPIClientNode(Node):
                 for action in chunk:
                     self.commanded_log.append(action[:8].copy())
 
-                # 2. Execute chunk and sample actual state in parallel at STEP_DURATION rate
-                exec_task = asyncio.create_task(self.action_executor.execute_chunk(chunk))
-                actual_samples = await self._sample_actual(n)
+                # 2. Execute chunk and sample actual state in parallel.
+                # First chunk of the episode runs slow (safe approach), rest run fast.
+                sd = STEP_DURATION_FIRST if step == 0 else STEP_DURATION_REST
+                print(f"  step_duration={sd}s")
+                exec_task = asyncio.create_task(self.action_executor.execute_chunk(chunk, sd))
+                actual_samples = await self._sample_actual(n, sd)
                 ok = await exec_task
 
                 for s in actual_samples:

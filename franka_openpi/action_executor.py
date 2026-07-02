@@ -22,10 +22,12 @@ JOINT_NAMES = [
 ]
 
 GRIPPER_CLOSE_THRESHOLD = 0.03
-STEP_DURATION = 1.0 / 30  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
+STEP_DURATION = 1.0  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
 # Actions are delta-based internally (re-integrated by AbsoluteActions), so consecutive
 # targets are spaced assuming the 30 Hz training rate. Executing slower (e.g. 20 Hz)
 # stretches every motion to >1x its trained duration and drifts the re-query cadence.
+STEP_DURATION_FIRST = 2.0  # first chunk of an episode: slow, safe initial approach
+STEP_DURATION_REST = 0.1   # subsequent chunks: fast
 
 # ── Gripper mode ──────────────────────────────────────────────────────────────
 # "binary"     — threshold-based open/close transitions (existing behaviour)
@@ -113,12 +115,14 @@ class ActionExecutor:
         except asyncio.TimeoutError:
             pass
 
-    async def _run_gripper_continuous(self, finger_positions: list[float]):
+    async def _run_gripper_continuous(
+        self, finger_positions: list[float], step_duration: float = STEP_DURATION
+    ):
         """Send policy gripper positions step-by-step, cancelling the previous each time."""
         loop = asyncio.get_event_loop()
         t0 = loop.time()
         for i, finger_pos in enumerate(finger_positions):
-            wait = i * STEP_DURATION - (loop.time() - t0)
+            wait = i * step_duration - (loop.time() - t0)
             if wait > 0:
                 await asyncio.sleep(wait)
             await self._send_gripper_width(finger_pos)
@@ -160,7 +164,9 @@ class ActionExecutor:
 
     # ── main execution ────────────────────────────────────────────────────────
 
-    async def execute_chunk(self, chunk: np.ndarray) -> bool:
+    async def execute_chunk(
+        self, chunk: np.ndarray, step_duration: float = STEP_DURATION
+    ) -> bool:
         """Send the full chunk as one FollowJointTrajectory goal and await completion."""
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = list(JOINT_NAMES)
@@ -168,7 +174,7 @@ class ActionExecutor:
         for i, action in enumerate(chunk):
             pt = JointTrajectoryPoint()
             pt.positions = [float(p) for p in action[:7]]
-            t = (i + 1) * STEP_DURATION
+            t = (i + 1) * step_duration
             pt.time_from_start = Duration(sec=int(t), nanosec=int((t % 1) * 1e9))
             goal.trajectory.points.append(pt)
 
@@ -191,7 +197,7 @@ class ActionExecutor:
             if self._gripper_task and not self._gripper_task.done():
                 self._gripper_task.cancel()
             self._gripper_task = asyncio.create_task(
-                self._run_gripper_continuous(finger_positions)
+                self._run_gripper_continuous(finger_positions, step_duration)
             )
         else:
             # binary: detect open/close transitions and fire at transition points
@@ -200,7 +206,7 @@ class ActionExecutor:
             for i, action in enumerate(chunk):
                 gripper_open = float(action[7]) >= GRIPPER_CLOSE_THRESHOLD
                 if gripper_open != last_state:
-                    transitions.append((i * STEP_DURATION, gripper_open))
+                    transitions.append((i * step_duration, gripper_open))
                     last_state = gripper_open
             if transitions:
                 self._gripper_is_open = last_state

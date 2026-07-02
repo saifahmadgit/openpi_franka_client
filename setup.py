@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/openpi_franka.launch.xml',
             'launch/openpi_franka.launch.py',
+            'launch/openpi_franka.launch_sim.py',
             'launch/act_franka.launch.py',
             'launch/groot_franka.launch.py',
             'launch/camera_launcher.launch.py',
