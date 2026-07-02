@@ -22,7 +22,7 @@ JOINT_NAMES = [
 ]
 
 GRIPPER_CLOSE_THRESHOLD = 0.03
-STEP_DURATION = 1.0  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
+STEP_DURATION = 0.5  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
 # Actions are delta-based internally (re-integrated by AbsoluteActions), so consecutive
 # targets are spaced assuming the 30 Hz training rate. Executing slower (e.g. 20 Hz)
 # stretches every motion to >1x its trained duration and drifts the re-query cadence.
@@ -31,6 +31,71 @@ STEP_DURATION = 1.0  # seconds per policy step (30 Hz = saifahmad123/Teleop fps)
 # "binary"     — threshold-based open/close transitions (existing behaviour)
 # "continuous" — send policy gripper position directly to hardware each step
 GRIPPER_MODE = "binary"
+
+# ── Velocity / acceleration limiting ────────────────────────────────────────────
+# The policy emits raw joint targets. Sent as a positions-only trajectory they can
+# imply velocities/accelerations above Franka's limits (especially the jump from the
+# arm's real position to the first target of each chunk) → firmware reflex (red mode).
+# We time-parameterize each chunk so no joint exceeds these bounds; segment durations
+# only ever stretch (never below STEP_DURATION), so motion is never sped up past the
+# trained cadence.
+ENFORCE_LIMITS = True
+# Conservative fraction of the FER (Franka Emika / Panda) hardware limits.
+# Base values are Franka's official per-joint max velocity / acceleration
+# (support.franka.de control_parameters), matching franka_fer_moveit_config
+# joint_limits.yaml. Start low, raise once stable.
+_LIMIT_SCALE = 0.07
+VEL_LIMIT = (
+    np.array([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]) * _LIMIT_SCALE
+)  # rad/s
+ACC_LIMIT = (
+    np.array([15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]) * _LIMIT_SCALE
+)  # rad/s^2
+
+
+def _waypoint_velocities(knots: np.ndarray, times: np.ndarray) -> np.ndarray:
+    """Central-difference joint velocities at each knot; zero at both ends (rest→rest)."""
+    vel = np.zeros_like(knots)
+    for k in range(1, len(knots) - 1):
+        vel[k] = (knots[k + 1] - knots[k - 1]) / (times[k - 1] + times[k])
+    return vel
+
+
+def _time_parameterize(
+    q_start: np.ndarray,
+    targets: np.ndarray,
+    v_max: np.ndarray = VEL_LIMIT,
+    a_max: np.ndarray = ACC_LIMIT,
+    dt_floor: float = STEP_DURATION,
+    max_iter: int = 8,
+):
+    """Assign segment timing + waypoint velocities so joint vel/accel stay bounded.
+
+    Path knots are [q_start, targets[0..N-1]]; q_start (the arm's measured state) is
+    used only to time the first segment and is not re-emitted as a waypoint — the
+    controller already starts from the measured state.
+
+    Returns (positions (N,7), velocities (N,7), time_from_start (N,)).
+    """
+    knots = np.vstack([q_start, targets])  # (N+1, 7)
+    seg = np.diff(knots, axis=0)  # (N, 7) per-segment displacement
+
+    # 1) velocity bound (and a floor to preserve the trained step duration)
+    times = np.maximum(np.max(np.abs(seg) / v_max, axis=1), dt_floor)
+
+    # 2) acceleration bound: stretch any offending segment (a ∝ 1/t² → scale by √ratio)
+    for _ in range(max_iter):
+        vel = _waypoint_velocities(knots, times)
+        acc = (vel[1:] - vel[:-1]) / times[:, None]
+        ratio = np.max(np.abs(acc) / a_max, axis=1)
+        over = ratio > 1.0
+        if not np.any(over):
+            break
+        times[over] *= np.sqrt(ratio[over])
+
+    vel = _waypoint_velocities(knots, times)
+    t_cum = np.cumsum(times)
+    return knots[1:], vel[1:], t_cum
 
 
 class ActionExecutor:
@@ -113,12 +178,15 @@ class ActionExecutor:
         except asyncio.TimeoutError:
             pass
 
-    async def _run_gripper_continuous(self, finger_positions: list[float]):
+    async def _run_gripper_continuous(
+        self, finger_positions: list[float], step_start: list[float] | None = None
+    ):
         """Send policy gripper positions step-by-step, cancelling the previous each time."""
         loop = asyncio.get_event_loop()
         t0 = loop.time()
         for i, finger_pos in enumerate(finger_positions):
-            wait = i * STEP_DURATION - (loop.time() - t0)
+            target = step_start[i] if step_start is not None else i * STEP_DURATION
+            wait = target - (loop.time() - t0)
             if wait > 0:
                 await asyncio.sleep(wait)
             await self._send_gripper_width(finger_pos)
@@ -160,15 +228,38 @@ class ActionExecutor:
 
     # ── main execution ────────────────────────────────────────────────────────
 
-    async def execute_chunk(self, chunk: np.ndarray) -> bool:
-        """Send the full chunk as one FollowJointTrajectory goal and await completion."""
+    async def execute_chunk(
+        self, chunk: np.ndarray, q_start: np.ndarray | None = None
+    ) -> bool:
+        """Send the full chunk as one FollowJointTrajectory goal and await completion.
+
+        q_start: current measured arm joint positions (7,). Used to time-parameterize
+        the chunk so joint velocity/acceleration stay within limits (see _time_parameterize).
+        """
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = list(JOINT_NAMES)
 
-        for i, action in enumerate(chunk):
+        targets = np.asarray([action[:7] for action in chunk], dtype=float)
+        if ENFORCE_LIMITS and q_start is not None and len(targets) > 0:
+            positions, velocities, times = _time_parameterize(
+                np.asarray(q_start, dtype=float), targets
+            )
+        else:
+            # Fallback: original fixed-cadence, positions-only trajectory.
+            positions = targets
+            velocities = [None] * len(targets)
+            times = np.array([(i + 1) * STEP_DURATION for i in range(len(targets))])
+
+        # step_times[i] = when chunk action i completes — keeps the gripper in sync
+        # with the arm even after segments are stretched to respect limits.
+        step_times = [float(t) for t in times]
+
+        for i in range(len(positions)):
             pt = JointTrajectoryPoint()
-            pt.positions = [float(p) for p in action[:7]]
-            t = (i + 1) * STEP_DURATION
+            pt.positions = [float(p) for p in positions[i]]
+            if velocities[i] is not None:
+                pt.velocities = [float(v) for v in velocities[i]]
+            t = step_times[i]
             pt.time_from_start = Duration(sec=int(t), nanosec=int((t % 1) * 1e9))
             goal.trajectory.points.append(pt)
 
@@ -186,12 +277,14 @@ class ActionExecutor:
             return False
 
         # ── gripper ───────────────────────────────────────────────────────────
+        # start time of chunk step i (arm reaches step i at step_times[i]).
+        step_start = [0.0] + step_times[:-1]
         if GRIPPER_MODE == "continuous":
             finger_positions = [float(action[7]) for action in chunk]
             if self._gripper_task and not self._gripper_task.done():
                 self._gripper_task.cancel()
             self._gripper_task = asyncio.create_task(
-                self._run_gripper_continuous(finger_positions)
+                self._run_gripper_continuous(finger_positions, step_start)
             )
         else:
             # binary: detect open/close transitions and fire at transition points
@@ -200,7 +293,7 @@ class ActionExecutor:
             for i, action in enumerate(chunk):
                 gripper_open = float(action[7]) >= GRIPPER_CLOSE_THRESHOLD
                 if gripper_open != last_state:
-                    transitions.append((i * STEP_DURATION, gripper_open))
+                    transitions.append((step_start[i], gripper_open))
                     last_state = gripper_open
             if transitions:
                 self._gripper_is_open = last_state

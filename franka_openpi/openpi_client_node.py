@@ -317,8 +317,13 @@ class OpenPIClientNode(Node):
                 for action in chunk:
                     self.commanded_log.append(action[:8].copy())
 
-                # 2. Execute chunk and sample actual state in parallel at STEP_DURATION rate
-                exec_task = asyncio.create_task(self.action_executor.execute_chunk(chunk))
+                # 2. Execute chunk and sample actual state in parallel at STEP_DURATION rate.
+                #    Pass the current measured arm joints so the executor can time-parameterize
+                #    the chunk (incl. the jump to action[0]) within velocity/accel limits.
+                q_start = self._raw_joints[:7].copy()
+                exec_task = asyncio.create_task(
+                    self.action_executor.execute_chunk(chunk, q_start=q_start)
+                )
                 actual_samples = await self._sample_actual(n)
                 ok = await exec_task
 
