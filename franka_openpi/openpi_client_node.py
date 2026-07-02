@@ -17,12 +17,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 
-from franka_openpi.action_executor import (
-    ActionExecutor,
-    STEP_DURATION,
-    STEP_DURATION_FIRST,
-    STEP_DURATION_REST,
-)
+from franka_openpi.action_executor import ActionExecutor, STEP_DURATION
 
 
 class _NoPingPolicy(websocket_client_policy.WebsocketClientPolicy):
@@ -253,11 +248,11 @@ class OpenPIClientNode(Node):
         except Exception as e:
             print(f"[OpenPI] Plot failed: {e}")
 
-    async def _sample_actual(self, n: int, step_duration: float = STEP_DURATION) -> list:
+    async def _sample_actual(self, n: int) -> list:
         """Sample actual joint state once per policy step during chunk execution."""
         samples = []
         for _ in range(n):
-            await asyncio.sleep(step_duration)
+            await asyncio.sleep(STEP_DURATION)
             samples.append(self._raw_joints[:8].copy())
         return samples
 
@@ -322,12 +317,9 @@ class OpenPIClientNode(Node):
                 for action in chunk:
                     self.commanded_log.append(action[:8].copy())
 
-                # 2. Execute chunk and sample actual state in parallel.
-                # First chunk of the episode runs slow (safe approach), rest run fast.
-                sd = STEP_DURATION_FIRST if step == 0 else STEP_DURATION_REST
-                print(f"  step_duration={sd}s")
-                exec_task = asyncio.create_task(self.action_executor.execute_chunk(chunk, sd))
-                actual_samples = await self._sample_actual(n, sd)
+                # 2. Execute chunk and sample actual state in parallel at STEP_DURATION rate
+                exec_task = asyncio.create_task(self.action_executor.execute_chunk(chunk))
+                actual_samples = await self._sample_actual(n)
                 ok = await exec_task
 
                 for s in actual_samples:
