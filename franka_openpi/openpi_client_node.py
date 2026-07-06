@@ -120,7 +120,10 @@ class OpenPIClientNode(Node):
         self.action_executor = ActionExecutor(self)
         self.commanded_log = []
         self.actual_log = []
+        self.actual_time_log = []   # wall-clock time (s, rel. to first request) per actual sample
+        self.query_spans_log = []   # (t_request, t_received) per chunk — the inference wait
         self.chunk_sizes_log = []
+        self._t0 = None             # monotonic origin: set at the very first chunk request
         self._debug_dir = os.path.expanduser("~/Franka/src/franka_openpi/debug")
         os.makedirs(self._debug_dir, exist_ok=True)
 
@@ -194,22 +197,31 @@ class OpenPIClientNode(Node):
     # ── debug logging / plotting ─────────────────────────────────────────
 
     def _init_episode_logs(self):
-        for fname in ("commanded.npy", "actual.npy", "chunks.npy", "openpi_debug.png"):
+        for fname in (
+            "commanded.npy", "actual.npy", "chunks.npy", "openpi_debug.png",
+            "actual_times.npy", "query_spans.npy", "openpi_debug_time.png",
+        ):
             p = os.path.join(self._debug_dir, self._debug_prefix + fname)
             if os.path.exists(p):
                 os.remove(p)
         self.commanded_log.clear()
         self.actual_log.clear()
+        self.actual_time_log.clear()
+        self.query_spans_log.clear()
         self.chunk_sizes_log.clear()
+        self._t0 = None
 
     def _save_logs(self):
         np.save(os.path.join(self._debug_dir, self._debug_prefix + "commanded.npy"), np.array(self.commanded_log))
         np.save(os.path.join(self._debug_dir, self._debug_prefix + "actual.npy"),    np.array(self.actual_log))
         np.save(os.path.join(self._debug_dir, self._debug_prefix + "chunks.npy"),    np.array(self.chunk_sizes_log))
+        np.save(os.path.join(self._debug_dir, self._debug_prefix + "actual_times.npy"), np.array(self.actual_time_log))
+        np.save(os.path.join(self._debug_dir, self._debug_prefix + "query_spans.npy"),  np.array(self.query_spans_log))
         # Refresh the plot after every chunk. The old `% 50` gate assumed 50-step
         # chunks and never fired for small exec_horizon values (e.g. 10 → 10,20,30
         # never hits a multiple of 50), so no plot appeared until an episode ended.
         self._plot_debug()
+        self._plot_debug_time()
 
     def _plot_debug(self):
         try:
@@ -248,13 +260,71 @@ class OpenPIClientNode(Node):
         except Exception as e:
             print(f"[OpenPI] Plot failed: {e}")
 
-    async def _sample_actual(self, n: int) -> list:
-        """Sample actual joint state once per policy step during chunk execution."""
-        samples = []
+    def _plot_debug_time(self):
+        """Actual robot state vs wall-clock time — the SAME actual dots as _plot_debug,
+        placed on a real-time x-axis (t=0 at the first chunk request) so the idle time
+        between reaching a chunk's end and receiving the next chunk is visible as a gap
+        + shaded band. No commanded/server points here — only the actual trajectory."""
+        try:
+            if not self.actual_log or not self.actual_time_log:
+                return
+            act = np.array(self.actual_log)
+            t = np.array(self.actual_time_log)
+            n = min(len(act), len(t))
+            if n == 0:
+                return
+            act, t = act[:n], t[:n]
+            waits = np.array(self.query_spans_log) if self.query_spans_log else np.empty((0, 2))
+            total_wait = float(np.sum(waits[:, 1] - waits[:, 0])) if len(waits) else 0.0
+
+            from franka_openpi.action_executor import GRIPPER_CLOSE_THRESHOLD
+            fig, axes = plt.subplots(8, 1, figsize=(16, 20), sharex=True)
+            fig.suptitle(
+                f"Actual Robot State vs Time — {n} samples, {len(waits)} chunk requests, "
+                f"{total_wait:.1f}s total inference wait",
+                fontsize=13,
+            )
+
+            def _shade_waits(ax):
+                for k, (ws, we) in enumerate(waits):
+                    ax.axvspan(ws, we, color="gold", alpha=0.25,
+                               label="waiting for chunk" if k == 0 else None)
+
+            for j, ax in enumerate(axes[:7]):
+                _shade_waits(ax)
+                ax.scatter(t, act[:, j], color="tomato", s=10, label="actual (robot state)")
+                ax.set_ylabel(f"Joint {j + 1}\n(rad)", fontsize=8)
+                ax.legend(loc="upper right", fontsize=7)
+                ax.grid(True, alpha=0.3)
+            ax_g = axes[7]
+            _shade_waits(ax_g)
+            ax_g.scatter(t, act[:, 7], color="tomato", s=10, label="actual (finger joint)")
+            ax_g.axhline(GRIPPER_CLOSE_THRESHOLD, color="orange", linewidth=1, linestyle="--",
+                         label=f"close threshold ({GRIPPER_CLOSE_THRESHOLD})")
+            ax_g.set_ylabel("Gripper\n(m)", fontsize=8)
+            ax_g.legend(loc="upper right", fontsize=7)
+            ax_g.grid(True, alpha=0.3)
+            axes[-1].set_xlabel("time (s)")
+            plt.tight_layout()
+            path = os.path.join(self._debug_dir, self._debug_prefix + "openpi_debug_time.png")
+            plt.savefig(path, dpi=150)
+            plt.close(fig)
+            print(f"[OpenPI] Time plot saved → {path}")
+        except Exception as e:
+            print(f"[OpenPI] Time plot failed: {e}")
+
+    async def _sample_actual(self, n: int) -> tuple[list, list]:
+        """Sample actual joint state once per policy step during chunk execution.
+
+        Also returns the wall-clock time of each sample (s, relative to the run's first
+        chunk request) so the trajectory can be plotted against real time.
+        """
+        samples, times = [], []
         for _ in range(n):
             await asyncio.sleep(STEP_DURATION)
             samples.append(self._raw_joints[:8].copy())
-        return samples
+            times.append(time.monotonic() - self._t0)
+        return samples, times
 
     # ── main loop ────────────────────────────────────────────────────────
 
@@ -268,6 +338,7 @@ class OpenPIClientNode(Node):
         finally:
             executor.shutdown()
             self._plot_debug()
+            self._plot_debug_time()
 
     async def _run_async(self, num_episodes: int):
         loop = asyncio.get_event_loop()
@@ -301,12 +372,19 @@ class OpenPIClientNode(Node):
 
             step = 0
             while step < 500:
-                # 1. Query policy from true current robot state
+                # 1. Query policy from true current robot state.
+                #    Time the request→receive span: this is the idle window the robot
+                #    spends waiting after reaching the previous chunk's last point.
                 print(f"  Querying policy at step {step}...")
+                t_req = time.monotonic()
+                if self._t0 is None:
+                    self._t0 = t_req  # timeline origin = first chunk request
                 chunk = await loop.run_in_executor(None, self._fetch_chunk_sync)
+                t_recv = time.monotonic()
                 if chunk is None:
                     print("  ERROR: inference failed — stopping episode.")
                     break
+                self.query_spans_log.append((t_req - self._t0, t_recv - self._t0))
 
                 horizon = self.exec_horizon if self.exec_horizon > 0 else len(chunk)
                 n = min(horizon, len(chunk), 500 - step)
@@ -324,11 +402,12 @@ class OpenPIClientNode(Node):
                 exec_task = asyncio.create_task(
                     self.action_executor.execute_chunk(chunk, q_start=q_start)
                 )
-                actual_samples = await self._sample_actual(n)
+                actual_samples, actual_times = await self._sample_actual(n)
                 ok = await exec_task
 
                 for s in actual_samples:
                     self.actual_log.append(s)
+                self.actual_time_log.extend(actual_times)
                 self._save_logs()
 
                 step += n
@@ -337,6 +416,7 @@ class OpenPIClientNode(Node):
                     break
 
             self._plot_debug()
+            self._plot_debug_time()
             print(f"  Episode {ep + 1} done ({step} steps).")
 
 
