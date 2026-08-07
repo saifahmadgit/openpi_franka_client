@@ -63,10 +63,6 @@ JOINT_ORDER = [
     "fer_finger_joint2",
 ]
 
-# Slack (s) added to the inference-time estimate when scheduling the next request, so a
-# slower-than-average inference still lands before the current chunk runs out.
-PREFETCH_MARGIN = 0.15
-
 STATE_DIM = 9   # joints read from /joint_states (7 arm + 2 finger)
 # Policy expects the full 9-dim state [j1..j7, finger_joint1, finger_joint2].
 # The checkpoint's norm_stats are 9-dim; sending 8 mis-aligns normalization
@@ -126,17 +122,13 @@ class OpenPIClientNode(Node):
         self.smoothed_log = []      # what was actually sent to the controller
         self.actual_log = []
         self.actual_time_log = []   # wall-clock time (s, rel. to first request) per actual sample
-        self.actual_step_log = []   # fractional step index per actual sample (see _sample_actual)
         self.query_spans_log = []   # (t_request, t_received) per chunk — the inference wait
         self.chunk_sizes_log = []
         self._t0 = None             # monotonic origin: set at the very first chunk request
-        # Rendering the debug figures took ~2 s per chunk on the control loop, which the
-        # arm spent stopped at a chunk boundary. Renders now run on a worker thread.
+        # Rendering the two debug figures took ~2 s per chunk, and it ran inline on the
+        # control loop — time the arm spent stopped at a chunk boundary. Renders now go
+        # to a worker thread; nothing about the commands sent to the arm changes.
         self._plot_thread: threading.Thread | None = None
-        # EMAs used to schedule the next inference request so it lands just as the current
-        # chunk finishes — see _run_async.
-        self._exec_ema: float | None = None    # measured chunk execution time (s)
-        self._infer_ema: float | None = None   # measured inference round-trip (s)
         self._debug_dir = os.path.expanduser("~/Franka/src/franka_openpi/debug")
         os.makedirs(self._debug_dir, exist_ok=True)
 
@@ -207,30 +199,12 @@ class OpenPIClientNode(Node):
             self.get_logger().error(f"Infer request failed: {e}")
             return None
 
-    async def _fetch_after(self, delay: float, loop) -> tuple:
-        """Sleep `delay`, then request a chunk. Returns (chunk, t_request, t_received).
-
-        The observation is captured inside _fetch_chunk_sync at request time, so delaying
-        the request is what keeps the policy's view of the scene current — see the call
-        site in _run_async for why the delay is chosen the way it is.
-        """
-        if delay > 0:
-            await asyncio.sleep(delay)
-        t_req = time.monotonic()
-        if self._t0 is None:
-            self._t0 = t_req  # timeline origin = first chunk request
-        chunk = await loop.run_in_executor(None, self._fetch_chunk_sync)
-        t_recv = time.monotonic()
-        dt = t_recv - t_req
-        self._infer_ema = dt if self._infer_ema is None else 0.7 * self._infer_ema + 0.3 * dt
-        return chunk, t_req, t_recv
-
     # ── debug logging / plotting ─────────────────────────────────────────
 
     def _init_episode_logs(self):
         for fname in (
             "commanded.npy", "smoothed.npy", "actual.npy", "chunks.npy", "openpi_debug.png",
-            "actual_times.npy", "actual_steps.npy", "query_spans.npy", "openpi_debug_time.png",
+            "actual_times.npy", "query_spans.npy", "openpi_debug_time.png",
         ):
             p = os.path.join(self._debug_dir, self._debug_prefix + fname)
             if os.path.exists(p):
@@ -239,7 +213,6 @@ class OpenPIClientNode(Node):
         self.smoothed_log.clear()
         self.actual_log.clear()
         self.actual_time_log.clear()
-        self.actual_step_log.clear()
         self.query_spans_log.clear()
         self.chunk_sizes_log.clear()
         self._t0 = None
@@ -252,17 +225,16 @@ class OpenPIClientNode(Node):
         """
         return (
             np.array(self.commanded_log), np.array(self.smoothed_log),
-            np.array(self.actual_log), np.array(self.actual_step_log),
-            np.array(self.actual_time_log), np.array(self.query_spans_log),
+            np.array(self.actual_log), np.array(self.actual_time_log),
+            np.array(self.query_spans_log),
         )
 
     def _save_logs(self):
-        cmd, sm, act, act_steps, act_t, waits = self._snapshot()
+        cmd, sm, act, act_t, waits = self._snapshot()
         d, p = self._debug_dir, self._debug_prefix
         np.save(os.path.join(d, p + "commanded.npy"),    cmd)
         np.save(os.path.join(d, p + "smoothed.npy"),     sm)
         np.save(os.path.join(d, p + "actual.npy"),       act)
-        np.save(os.path.join(d, p + "actual_steps.npy"), act_steps)
         np.save(os.path.join(d, p + "actual_times.npy"), act_t)
         np.save(os.path.join(d, p + "query_spans.npy"),  waits)
         np.save(os.path.join(d, p + "chunks.npy"),       np.array(self.chunk_sizes_log))
@@ -270,7 +242,7 @@ class OpenPIClientNode(Node):
         # gate assumed 50-step chunks and never fired for small exec_horizon values
         # (e.g. 10 → 10,20,30 never hits a multiple of 50), so no plot appeared until an
         # episode ended; rendering inline instead cost ~2 s of chunk-boundary dead time.
-        self._render_async(cmd, sm, act, act_steps, act_t, waits)
+        self._render_async(cmd, sm, act, act_t, waits)
 
     def _render_async(self, *snapshot):
         """Render both figures on a worker thread; skip if one is still in flight.
@@ -281,26 +253,23 @@ class OpenPIClientNode(Node):
         if self._plot_thread is not None and self._plot_thread.is_alive():
             return
 
-        def _worker(cmd, sm, act, act_steps, act_t, waits):
-            self._plot_debug(cmd, sm, act, act_steps)
+        def _worker(cmd, sm, act, act_t, waits):
+            self._plot_debug(cmd, sm, act)
             self._plot_debug_time(act, act_t, waits)
 
         self._plot_thread = threading.Thread(target=_worker, args=snapshot, daemon=True)
         self._plot_thread.start()
 
-    def _plot_debug(self, cmd, sm, act, act_steps):
+    def _plot_debug(self, cmd, sm, act):
         try:
-            if len(cmd) == 0 or len(act) == 0:
+            n = min(len(cmd), len(act))
+            if n == 0:
                 return
-            n = len(cmd)
+            cmd, act = cmd[:n], act[:n]
             # smoothed is logged alongside commanded, so it is at least as long as cmd;
             # guard anyway so a partially-written log can still be plotted.
             sm = sm[:n] if len(sm) >= n else None
             steps = np.arange(n)
-            # `act` is now sampled for each chunk's full (stretched) duration, so it has
-            # more rows than `cmd`. act_steps carries each sample's fractional position on
-            # the command step axis, which keeps the series aligned without resampling.
-            xa = act_steps if len(act_steps) == len(act) else np.arange(len(act))
 
             from franka_openpi.action_executor import GRIPPER_CLOSE_THRESHOLD, SMOOTH_ENABLE
             fig, axes = plt.subplots(8, 1, figsize=(20, 32), sharex=True)
@@ -310,14 +279,14 @@ class OpenPIClientNode(Node):
                 ax.scatter(steps, cmd[:, j], color="steelblue", s=18, label="commanded (policy)")
                 if sm is not None:
                     ax.scatter(steps, sm[:, j], color="seagreen", s=14, marker="x", label="smoothed (sent to controller)")
-                ax.scatter(xa, act[:, j], color="tomato",    s=18, label="actual (robot state)")
+                ax.scatter(steps, act[:, j], color="tomato",    s=18, label="actual (robot state)")
                 ax.set_ylabel(f"Joint {j + 1}\n(rad)", fontsize=16)
                 ax.legend(loc="upper right", fontsize=14)
                 ax.tick_params(axis="both", labelsize=13)
                 ax.grid(True, alpha=0.3)
             ax_g = axes[7]
             ax_g.scatter(steps, cmd[:, 7], color="steelblue", s=18, label="commanded (policy)")
-            ax_g.scatter(xa, act[:, 7], color="tomato",    s=18, label="actual (finger joint)")
+            ax_g.scatter(steps, act[:, 7], color="tomato",    s=18, label="actual (finger joint)")
             ax_g.axhline(GRIPPER_CLOSE_THRESHOLD, color="orange", linewidth=1.5, linestyle="--", label=f"close threshold ({GRIPPER_CLOSE_THRESHOLD})")
             ax_g.set_ylabel("Gripper\n(m)", fontsize=16)
             ax_g.legend(loc="upper right", fontsize=14)
@@ -336,10 +305,7 @@ class OpenPIClientNode(Node):
         """Actual robot state vs wall-clock time — the SAME actual dots as _plot_debug,
         placed on a real-time x-axis (t=0 at the first chunk request) so the idle time
         between reaching a chunk's end and receiving the next chunk is visible as a gap
-        + shaded band. No commanded/server points here — only the actual trajectory.
-
-        With prefetching the shaded bands now overlap chunk execution rather than sitting
-        in the gaps between chunks — that overlap is the point of the change."""
+        + shaded band. No commanded/server points here — only the actual trajectory."""
         try:
             n = min(len(act), len(t))
             if n == 0:
@@ -387,26 +353,17 @@ class OpenPIClientNode(Node):
         except Exception as e:
             print(f"[OpenPI] Time plot failed: {e}")
 
-    async def _sample_actual(self, n: int, exec_task) -> tuple[list, list]:
-        """Sample actual joint state at STEP_DURATION until the trajectory finishes.
+    async def _sample_actual(self, n: int) -> tuple[list, list]:
+        """Sample actual joint state once per policy step during chunk execution.
 
-        Previously this slept exactly n * STEP_DURATION, but _time_parameterize stretches
-        chunks past their nominal duration to respect the velocity/accel limits (measured:
-        2.0-2.3 s against a 1.67 s nominal), so the tail of every chunk went unlogged and
-        the debug plot understated what the arm did at chunk boundaries. Sampling until the
-        controller reports done covers the whole motion.
-
-        Returns the samples plus, per sample, the wall-clock time (s, relative to the run's
-        first chunk request) and the fractional command-step index it corresponds to.
+        Also returns the wall-clock time of each sample (s, relative to the run's first
+        chunk request) so the trajectory can be plotted against real time.
         """
         samples, times = [], []
-        cap = max(4 * n, n + 60)  # runaway guard if the controller never returns
-        while len(samples) < cap:
+        for _ in range(n):
             await asyncio.sleep(STEP_DURATION)
             samples.append(self._raw_joints[:8].copy())
             times.append(time.monotonic() - self._t0)
-            if exec_task.done() and len(samples) >= n:
-                break
         return samples, times
 
     # ── main loop ────────────────────────────────────────────────────────
@@ -421,11 +378,11 @@ class OpenPIClientNode(Node):
         finally:
             executor.shutdown()
             # Final render runs inline — the control loop is finished, so blocking is free,
-            # and a worker thread would be killed on process exit before it could save.
+            # and a daemon worker would be killed on process exit before it could save.
             if self._plot_thread is not None and self._plot_thread.is_alive():
                 self._plot_thread.join(timeout=30.0)
-            cmd, sm, act, act_steps, act_t, waits = self._snapshot()
-            self._plot_debug(cmd, sm, act, act_steps)
+            cmd, sm, act, act_t, waits = self._snapshot()
+            self._plot_debug(cmd, sm, act)
             self._plot_debug_time(act, act_t, waits)
 
     async def _run_async(self, num_episodes: int):
@@ -459,14 +416,16 @@ class OpenPIClientNode(Node):
             print(f"{'='*50}")
 
             step = 0
-            # Prime the pipeline: the first request has nothing to overlap with, so it
-            # goes out immediately.
-            pending = asyncio.create_task(self._fetch_after(0.0, loop))
             while step < 500:
-                # 1. Collect the chunk requested during the *previous* chunk's execution.
-                print(f"  Awaiting chunk for step {step}...")
-                chunk, t_req, t_recv = await pending
-                pending = None
+                # 1. Query policy from true current robot state.
+                #    Time the request→receive span: this is the idle window the robot
+                #    spends waiting after reaching the previous chunk's last point.
+                print(f"  Querying policy at step {step}...")
+                t_req = time.monotonic()
+                if self._t0 is None:
+                    self._t0 = t_req  # timeline origin = first chunk request
+                chunk = await loop.run_in_executor(None, self._fetch_chunk_sync)
+                t_recv = time.monotonic()
                 if chunk is None:
                     print("  ERROR: inference failed — stopping episode.")
                     break
@@ -495,37 +454,14 @@ class OpenPIClientNode(Node):
                 #    Pass the current measured arm joints so the executor can time-parameterize
                 #    the chunk (incl. the jump to action[0]) within velocity/accel limits.
                 q_start = self._raw_joints[:7].copy()
-                t_exec0 = time.monotonic()
                 exec_task = asyncio.create_task(
                     self.action_executor.execute_chunk(smoothed, q_start=q_start)
                 )
-
-                # 4. Request the next chunk *during* execution, timed to arrive just as this
-                #    one ends. Firing it immediately would overlap more, but the observation
-                #    would then be a whole chunk stale; delaying until roughly one inference
-                #    time before the end keeps the observation fresh AND hides the latency.
-                #    Both estimates are EMAs of measured values, so this self-corrects.
-                lead = (self._infer_ema or 0.6) + PREFETCH_MARGIN
-                # Before the first chunk completes there is no measured duration, so fall
-                # back to the nominal one; without this the very first prefetch fires at
-                # delay 0 and hands over a chunk-stale observation.
-                exec_est = self._exec_ema if self._exec_ema is not None else n * STEP_DURATION
-                delay = max(0.0, exec_est - lead)
-                pending = asyncio.create_task(self._fetch_after(delay, loop))
-
-                actual_samples, actual_times = await self._sample_actual(n, exec_task)
+                actual_samples, actual_times = await self._sample_actual(n)
                 ok = await exec_task
 
-                dur = time.monotonic() - t_exec0
-                self._exec_ema = dur if self._exec_ema is None else 0.7 * self._exec_ema + 0.3 * dur
-
-                # Map each actual sample onto the command step axis. There are usually more
-                # samples than commands (the chunk is stretched by the limiter), so spread
-                # them evenly across this chunk's step range rather than assuming 1:1.
-                m = len(actual_samples)
-                for k, s in enumerate(actual_samples):
+                for s in actual_samples:
                     self.actual_log.append(s)
-                    self.actual_step_log.append(step + (k + 1) * n / max(m, 1))
                 self.actual_time_log.extend(actual_times)
                 self._save_logs()
 
@@ -534,18 +470,8 @@ class OpenPIClientNode(Node):
                     print("  WARNING: trajectory did not complete successfully.")
                     break
 
-            # A prefetch may still be in flight when the episode ends (horizon reached,
-            # inference failure, or a rejected trajectory). Drop it so its result can't
-            # leak into the next episode and so the loop can close cleanly.
-            if pending is not None and not pending.done():
-                pending.cancel()
-                try:
-                    await pending
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-            cmd, sm, act, act_steps, act_t, waits = self._snapshot()
-            self._plot_debug(cmd, sm, act, act_steps)
+            cmd, sm, act, act_t, waits = self._snapshot()
+            self._plot_debug(cmd, sm, act)
             self._plot_debug_time(act, act_t, waits)
             print(f"  Episode {ep + 1} done ({step} steps).")
 
