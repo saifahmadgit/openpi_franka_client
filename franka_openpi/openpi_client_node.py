@@ -17,7 +17,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 
-from franka_openpi.action_executor import ActionExecutor, STEP_DURATION
+from franka_openpi.action_executor import ActionExecutor, STEP_DURATION, smooth_chunk
 
 
 class _NoPingPolicy(websocket_client_policy.WebsocketClientPolicy):
@@ -119,6 +119,7 @@ class OpenPIClientNode(Node):
 
         self.action_executor = ActionExecutor(self)
         self.commanded_log = []
+        self.smoothed_log = []      # what was actually sent to the controller
         self.actual_log = []
         self.actual_time_log = []   # wall-clock time (s, rel. to first request) per actual sample
         self.query_spans_log = []   # (t_request, t_received) per chunk — the inference wait
@@ -198,13 +199,14 @@ class OpenPIClientNode(Node):
 
     def _init_episode_logs(self):
         for fname in (
-            "commanded.npy", "actual.npy", "chunks.npy", "openpi_debug.png",
+            "commanded.npy", "smoothed.npy", "actual.npy", "chunks.npy", "openpi_debug.png",
             "actual_times.npy", "query_spans.npy", "openpi_debug_time.png",
         ):
             p = os.path.join(self._debug_dir, self._debug_prefix + fname)
             if os.path.exists(p):
                 os.remove(p)
         self.commanded_log.clear()
+        self.smoothed_log.clear()
         self.actual_log.clear()
         self.actual_time_log.clear()
         self.query_spans_log.clear()
@@ -213,6 +215,7 @@ class OpenPIClientNode(Node):
 
     def _save_logs(self):
         np.save(os.path.join(self._debug_dir, self._debug_prefix + "commanded.npy"), np.array(self.commanded_log))
+        np.save(os.path.join(self._debug_dir, self._debug_prefix + "smoothed.npy"),  np.array(self.smoothed_log))
         np.save(os.path.join(self._debug_dir, self._debug_prefix + "actual.npy"),    np.array(self.actual_log))
         np.save(os.path.join(self._debug_dir, self._debug_prefix + "chunks.npy"),    np.array(self.chunk_sizes_log))
         np.save(os.path.join(self._debug_dir, self._debug_prefix + "actual_times.npy"), np.array(self.actual_time_log))
@@ -233,25 +236,33 @@ class OpenPIClientNode(Node):
             if n == 0:
                 return
             cmd, act = cmd[:n], act[:n]
+            # smoothed is logged alongside commanded, so it is at least as long as cmd;
+            # guard anyway so a partially-written log can still be plotted.
+            sm = np.array(self.smoothed_log)[:n] if len(self.smoothed_log) >= n else None
             steps = np.arange(n)
 
-            from franka_openpi.action_executor import GRIPPER_CLOSE_THRESHOLD
-            fig, axes = plt.subplots(8, 1, figsize=(16, 20), sharex=True)
-            fig.suptitle(f"Policy Command vs Robot State — {n} steps", fontsize=13)
+            from franka_openpi.action_executor import GRIPPER_CLOSE_THRESHOLD, SMOOTH_ENABLE
+            fig, axes = plt.subplots(8, 1, figsize=(20, 32), sharex=True)
+            smooth_note = " (smoothing off)" if not SMOOTH_ENABLE else ""
+            fig.suptitle(f"Policy Command vs Smoothed vs Robot State — {n} steps{smooth_note}", fontsize=22)
             for j, ax in enumerate(axes[:7]):
-                ax.scatter(steps, cmd[:, j], color="steelblue", s=10, label="commanded (policy)")
-                ax.scatter(steps, act[:, j], color="tomato",    s=10, label="actual (robot state)")
-                ax.set_ylabel(f"Joint {j + 1}\n(rad)", fontsize=8)
-                ax.legend(loc="upper right", fontsize=7)
+                ax.scatter(steps, cmd[:, j], color="steelblue", s=18, label="commanded (policy)")
+                if sm is not None:
+                    ax.scatter(steps, sm[:, j], color="seagreen", s=14, marker="x", label="smoothed (sent to controller)")
+                ax.scatter(steps, act[:, j], color="tomato",    s=18, label="actual (robot state)")
+                ax.set_ylabel(f"Joint {j + 1}\n(rad)", fontsize=16)
+                ax.legend(loc="upper right", fontsize=14)
+                ax.tick_params(axis="both", labelsize=13)
                 ax.grid(True, alpha=0.3)
             ax_g = axes[7]
-            ax_g.scatter(steps, cmd[:, 7], color="steelblue", s=10, label="commanded (policy)")
-            ax_g.scatter(steps, act[:, 7], color="tomato",    s=10, label="actual (finger joint)")
-            ax_g.axhline(GRIPPER_CLOSE_THRESHOLD, color="orange", linewidth=1, linestyle="--", label=f"close threshold ({GRIPPER_CLOSE_THRESHOLD})")
-            ax_g.set_ylabel("Gripper\n(m)", fontsize=8)
-            ax_g.legend(loc="upper right", fontsize=7)
+            ax_g.scatter(steps, cmd[:, 7], color="steelblue", s=18, label="commanded (policy)")
+            ax_g.scatter(steps, act[:, 7], color="tomato",    s=18, label="actual (finger joint)")
+            ax_g.axhline(GRIPPER_CLOSE_THRESHOLD, color="orange", linewidth=1.5, linestyle="--", label=f"close threshold ({GRIPPER_CLOSE_THRESHOLD})")
+            ax_g.set_ylabel("Gripper\n(m)", fontsize=16)
+            ax_g.legend(loc="upper right", fontsize=14)
+            ax_g.tick_params(axis="both", labelsize=13)
             ax_g.grid(True, alpha=0.3)
-            axes[-1].set_xlabel("step")
+            axes[-1].set_xlabel("step", fontsize=16)
             plt.tight_layout()
             path = os.path.join(self._debug_dir, self._debug_prefix + "openpi_debug.png")
             plt.savefig(path, dpi=150)
@@ -278,11 +289,11 @@ class OpenPIClientNode(Node):
             total_wait = float(np.sum(waits[:, 1] - waits[:, 0])) if len(waits) else 0.0
 
             from franka_openpi.action_executor import GRIPPER_CLOSE_THRESHOLD
-            fig, axes = plt.subplots(8, 1, figsize=(16, 20), sharex=True)
+            fig, axes = plt.subplots(8, 1, figsize=(20, 32), sharex=True)
             fig.suptitle(
                 f"Actual Robot State vs Time — {n} samples, {len(waits)} chunk requests, "
                 f"{total_wait:.1f}s total inference wait",
-                fontsize=13,
+                fontsize=22,
             )
 
             def _shade_waits(ax):
@@ -292,19 +303,21 @@ class OpenPIClientNode(Node):
 
             for j, ax in enumerate(axes[:7]):
                 _shade_waits(ax)
-                ax.scatter(t, act[:, j], color="tomato", s=10, label="actual (robot state)")
-                ax.set_ylabel(f"Joint {j + 1}\n(rad)", fontsize=8)
-                ax.legend(loc="upper right", fontsize=7)
+                ax.scatter(t, act[:, j], color="tomato", s=18, label="actual (robot state)")
+                ax.set_ylabel(f"Joint {j + 1}\n(rad)", fontsize=16)
+                ax.legend(loc="upper right", fontsize=14)
+                ax.tick_params(axis="both", labelsize=13)
                 ax.grid(True, alpha=0.3)
             ax_g = axes[7]
             _shade_waits(ax_g)
-            ax_g.scatter(t, act[:, 7], color="tomato", s=10, label="actual (finger joint)")
-            ax_g.axhline(GRIPPER_CLOSE_THRESHOLD, color="orange", linewidth=1, linestyle="--",
+            ax_g.scatter(t, act[:, 7], color="tomato", s=18, label="actual (finger joint)")
+            ax_g.axhline(GRIPPER_CLOSE_THRESHOLD, color="orange", linewidth=1.5, linestyle="--",
                          label=f"close threshold ({GRIPPER_CLOSE_THRESHOLD})")
-            ax_g.set_ylabel("Gripper\n(m)", fontsize=8)
-            ax_g.legend(loc="upper right", fontsize=7)
+            ax_g.set_ylabel("Gripper\n(m)", fontsize=16)
+            ax_g.legend(loc="upper right", fontsize=14)
+            ax_g.tick_params(axis="both", labelsize=13)
             ax_g.grid(True, alpha=0.3)
-            axes[-1].set_xlabel("time (s)")
+            axes[-1].set_xlabel("time (s)", fontsize=16)
             plt.tight_layout()
             path = os.path.join(self._debug_dir, self._debug_prefix + "openpi_debug_time.png")
             plt.savefig(path, dpi=150)
@@ -395,12 +408,22 @@ class OpenPIClientNode(Node):
                 for action in chunk:
                     self.commanded_log.append(action[:8].copy())
 
-                # 2. Execute chunk and sample actual state in parallel at STEP_DURATION rate.
+                # 2. Smooth the intermediate waypoints before execution. First and last
+                #    waypoints are reproduced exactly, so the arm still hits the poses the
+                #    policy asked for at the chunk boundaries — only the step-to-step noise
+                #    in between (the source of the accel spikes / table shake) is removed.
+                #    The gripper column is untouched, so the transition timing computed
+                #    inside execute_chunk is unaffected.
+                smoothed = smooth_chunk(chunk)
+                for action in smoothed:
+                    self.smoothed_log.append(action[:8].copy())
+
+                # 3. Execute chunk and sample actual state in parallel at STEP_DURATION rate.
                 #    Pass the current measured arm joints so the executor can time-parameterize
                 #    the chunk (incl. the jump to action[0]) within velocity/accel limits.
                 q_start = self._raw_joints[:7].copy()
                 exec_task = asyncio.create_task(
-                    self.action_executor.execute_chunk(chunk, q_start=q_start)
+                    self.action_executor.execute_chunk(smoothed, q_start=q_start)
                 )
                 actual_samples, actual_times = await self._sample_actual(n)
                 ok = await exec_task

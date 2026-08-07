@@ -1,6 +1,7 @@
 import asyncio
 
 import numpy as np
+from scipy.signal import savgol_filter
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from franka_msgs.action import Grasp, Move
@@ -22,7 +23,7 @@ JOINT_NAMES = [
 ]
 
 GRIPPER_CLOSE_THRESHOLD = 0.03
-STEP_DURATION = 0.5  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
+STEP_DURATION = 1 / 30  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
 # Actions are delta-based internally (re-integrated by AbsoluteActions), so consecutive
 # targets are spaced assuming the 30 Hz training rate. Executing slower (e.g. 20 Hz)
 # stretches every motion to >1x its trained duration and drifts the re-query cadence.
@@ -44,13 +45,64 @@ ENFORCE_LIMITS = True
 # Base values are Franka's official per-joint max velocity / acceleration
 # (support.franka.de control_parameters), matching franka_fer_moveit_config
 # joint_limits.yaml. Start low, raise once stable.
-_LIMIT_SCALE = 0.07
+_LIMIT_SCALE = 0.1
 VEL_LIMIT = (
     np.array([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]) * _LIMIT_SCALE
 )  # rad/s
 ACC_LIMIT = (
     np.array([15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]) * _LIMIT_SCALE
 )  # rad/s^2
+
+
+# ── Chunk smoothing ─────────────────────────────────────────────────────────────
+# The policy's per-step targets carry step-to-step noise. At STEP_DURATION = 1/30 the
+# time-parameterizer turns that zigzag into large alternating accelerations — the arm
+# shakes the table. Smoothing the intermediate waypoints removes the high-frequency
+# component while leaving the chunk's endpoints exactly where the policy put them, so
+# the robot still reaches the poses the policy asked for.
+SMOOTH_ENABLE = True
+SMOOTH_WINDOW = 9      # savgol window (samples, forced odd and ≤ chunk length)
+SMOOTH_POLYORDER = 3   # savgol fit order; must be < window
+SMOOTH_MIN_LEN = 5     # chunks shorter than this are passed through unchanged
+
+
+def smooth_chunk(chunk: np.ndarray) -> np.ndarray:
+    """Savitzky-Golay smooth the arm columns of a chunk, pinning both endpoints.
+
+    Only columns 0-6 (arm joints) are filtered; column 7 (gripper) is passed through
+    untouched — GRIPPER_MODE "binary" only compares it against GRIPPER_CLOSE_THRESHOLD,
+    so smoothing it could shift or erase an open/close transition without reducing jerk.
+
+    chunk[0] and chunk[-1] are reproduced exactly. Hard-assigning them would leave a
+    step between a pinned end and its smoothed neighbour, so each endpoint's residual
+    is instead redistributed across the chunk with a linear taper — the ends land on
+    the raw values and the correction dies out smoothly toward the middle.
+    """
+    arr = np.asarray(chunk, dtype=float)
+    n = len(arr)
+    if not SMOOTH_ENABLE or n < SMOOTH_MIN_LEN:
+        return arr
+
+    # savgol needs an odd window no longer than the signal, and window > polyorder.
+    win = min(SMOOTH_WINDOW, n if n % 2 else n - 1)
+    if win <= SMOOTH_POLYORDER:
+        return arr
+
+    arm = arr[:, :7]
+    # mode="interp" fits the edge samples from a polynomial over the real data rather
+    # than padding, so the ends are not dragged toward a fabricated boundary value.
+    sm = savgol_filter(arm, window_length=win, polyorder=SMOOTH_POLYORDER, axis=0, mode="interp")
+
+    w = np.linspace(0.0, 1.0, n)[:, None]
+    sm = sm + (arm[0] - sm[0]) * (1.0 - w) + (arm[-1] - sm[-1]) * w
+
+    out = arr.copy()
+    out[:, :7] = sm
+    # The taper makes the ends equal to the raw values analytically, but a + (b - a)
+    # is not bit-exact in floating point — assign them so "pinned" is literally true.
+    out[0, :7] = arm[0]
+    out[-1, :7] = arm[-1]
+    return out
 
 
 def _waypoint_velocities(knots: np.ndarray, times: np.ndarray) -> np.ndarray:
@@ -124,11 +176,11 @@ class ActionExecutor:
                 width=0.08, speed=0.1, adaptive_stop=False
             )
         else:
-            # Binary close: clean Move to 1 cm. adaptive_stop=False so it actually
-            # reaches the target — adaptive_stop activates for width<=0.01 and cancels
-            # the move on any stall, which stops it short of closing.
+            # Binary close: clean Move to 4 cm. adaptive_stop=False so it actually
+            # reaches the target — adaptive_stop cancels the move on any stall, which
+            # stops it short of closing.
             await self._interface.set_gripper_franka(
-                width=0.01, speed=0.05, adaptive_stop=False
+                width=0.025, speed=0.05, adaptive_stop=False
             )
 
     async def _run_gripper_transitions(self, transitions: list[tuple[float, bool]]):

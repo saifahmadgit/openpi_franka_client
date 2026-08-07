@@ -39,7 +39,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "prompt",
-                default_value="pick up the red object",
+                default_value="pick up the mustard bottle",
                 description="Task prompt for the policy",
             ),
             DeclareLaunchArgument(
@@ -137,7 +137,7 @@ def generate_launch_description():
                 parameters=[
                     {
                         "server_host": "129.105.69.11",
-                        "server_port": 8000,
+                        "server_port": 8001,
                         "prompt": LaunchConfiguration("prompt"),
                         "num_episodes": LaunchConfiguration("num_episodes"),
                         "exec_horizon": LaunchConfiguration("exec_horizon"),
