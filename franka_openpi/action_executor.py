@@ -23,7 +23,7 @@ JOINT_NAMES = [
 ]
 
 GRIPPER_CLOSE_THRESHOLD = 0.03
-STEP_DURATION = 1 / 30  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
+STEP_DURATION = 1 / 10  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
 # Actions are delta-based internally (re-integrated by AbsoluteActions), so consecutive
 # targets are spaced assuming the 30 Hz training rate. Executing slower (e.g. 20 Hz)
 # stretches every motion to >1x its trained duration and drifts the re-query cadence.
@@ -61,9 +61,9 @@ ACC_LIMIT = (
 # component while leaving the chunk's endpoints exactly where the policy put them, so
 # the robot still reaches the poses the policy asked for.
 SMOOTH_ENABLE = True
-SMOOTH_WINDOW = 9      # savgol window (samples, forced odd and ≤ chunk length)
-SMOOTH_POLYORDER = 3   # savgol fit order; must be < window
-SMOOTH_MIN_LEN = 5     # chunks shorter than this are passed through unchanged
+SMOOTH_WINDOW = 9  # savgol window (samples, forced odd and ≤ chunk length)
+SMOOTH_POLYORDER = 3  # savgol fit order; must be < window
+SMOOTH_MIN_LEN = 5  # chunks shorter than this are passed through unchanged
 
 
 def smooth_chunk(chunk: np.ndarray) -> np.ndarray:
@@ -91,7 +91,9 @@ def smooth_chunk(chunk: np.ndarray) -> np.ndarray:
     arm = arr[:, :7]
     # mode="interp" fits the edge samples from a polynomial over the real data rather
     # than padding, so the ends are not dragged toward a fabricated boundary value.
-    sm = savgol_filter(arm, window_length=win, polyorder=SMOOTH_POLYORDER, axis=0, mode="interp")
+    sm = savgol_filter(
+        arm, window_length=win, polyorder=SMOOTH_POLYORDER, axis=0, mode="interp"
+    )
 
     w = np.linspace(0.0, 1.0, n)[:, None]
     sm = sm + (arm[0] - sm[0]) * (1.0 - w) + (arm[-1] - sm[-1]) * w
