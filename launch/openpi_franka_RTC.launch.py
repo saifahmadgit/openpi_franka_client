@@ -7,6 +7,7 @@ DO NOT run this alongside openpi_franka.launch.py. Both drive
 fer_arm_controller, and the RTC node publishes to the controller's topic
 interface, which would preempt an action goal from the other pipeline mid-motion.
 """
+
 import os
 
 from launch import LaunchDescription
@@ -19,8 +20,16 @@ from launch_ros.parameter_descriptions import ParameterValue
 # Ensure openpi_client (installed in the project venv) is visible to the
 # system-Python ROS node executable.
 _VENV_SITE = os.path.join(
-    os.path.dirname(__file__), "..", "..", "..", "..", "..",
-    ".venv", "lib", "python3.12", "site-packages",
+    os.path.dirname(__file__),
+    "..",
+    "..",
+    "..",
+    "..",
+    "..",
+    ".venv",
+    "lib",
+    "python3.12",
+    "site-packages",
 )
 _VENV_SITE = os.path.normpath(_VENV_SITE)
 
@@ -44,6 +53,16 @@ def generate_launch_description():
                 description="Launch both front_1 and front_2 cameras (true) or only front_1",
             ),
             DeclareLaunchArgument(
+                "exec_horizon",
+                default_value="25",
+                description=(
+                    "s, actions played before the next inference fires. RTC's soft-mask "
+                    "region spans H-s-d actions, so s must be well below H-d or the mask "
+                    "is empty and chunks are pinned then unconstrained. Paper uses s~H/2 "
+                    "(H=50, s_min=25). 0 = fire at H-d (degenerate, comparison only)."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "rtc_d",
                 default_value="3",
                 description=(
@@ -54,7 +73,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "step_duration",
-                default_value="0.2",
+                default_value="0.1",
                 description=(
                     "Seconds per policy step. Matches the existing pipeline so RTC does "
                     "not silently change arm speed; the dataset is 30 fps (0.0333)."
@@ -185,6 +204,7 @@ def generate_launch_description():
                         "prompt": LaunchConfiguration("prompt"),
                         "num_episodes": LaunchConfiguration("num_episodes"),
                         "two_front_cameras": LaunchConfiguration("two_front_cameras"),
+                        "exec_horizon": LaunchConfiguration("exec_horizon"),
                         "rtc_d": LaunchConfiguration("rtc_d"),
                         "step_duration": LaunchConfiguration("step_duration"),
                         "send_prev_actions": LaunchConfiguration("send_prev_actions"),

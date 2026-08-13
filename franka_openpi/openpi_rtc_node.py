@@ -106,6 +106,19 @@ class OpenPIRTCNode(Node):
         # index H - d, and tell the server to freeze that many actions. 0 = adapt
         # from observed round trips. See _current_d for why this is sized off the
         # tail rather than the median.
+        # s, the execution horizon: how many actions of a chunk are played before
+        # the next inference is fired. This is NOT H-d.
+        #
+        # RTC's three regions are  [0,d) hard-frozen | [d, H-s) soft-masked |
+        # [H-s, H) free, so the soft mask -- the part that actually makes
+        # consecutive chunks agree rather than merely touching at one point --
+        # spans H-s-d actions. Firing at H-d makes the overlap exactly d, the
+        # whole of it gets hard-frozen, and the soft-mask region is empty; the
+        # discontinuity just moves from index 0 to index d.
+        #
+        # The paper uses s ~ H/2 (real-world: H=50, s_min=25). 0 = fire at H-d,
+        # the degenerate behaviour, kept only for comparison runs.
+        self.declare_parameter("exec_horizon", 25)
         self.declare_parameter("rtc_d", 3)
         # Extra steps added on top of the worst d seen so far. The splice index
         # must never exceed the frozen region, so this is pure safety margin.
@@ -135,6 +148,7 @@ class OpenPIRTCNode(Node):
         self.max_steps = int(self.get_parameter("max_steps").value)
         self._two_front_cameras = bool(self.get_parameter("two_front_cameras").value)
         self._step_duration = float(self.get_parameter("step_duration").value)
+        self._exec_horizon = int(self.get_parameter("exec_horizon").value)
         self._rtc_d = int(self.get_parameter("rtc_d").value)
         self._d_margin = int(self.get_parameter("rtc_d_margin").value)
         self._send_prev = bool(self.get_parameter("send_prev_actions").value)
@@ -360,8 +374,33 @@ class OpenPIRTCNode(Node):
         return int(np.clip(d, 1, max(1, h - 1)))
 
     def _fire_index(self) -> int:
-        """Chunk index at which to launch the next inference: H - d."""
-        return max(0, self._chunk_len() - self._current_d())
+        """Chunk index at which to launch the next inference -- the execution horizon s.
+
+        Capped at H-d regardless: firing later than that leaves less than d steps
+        of chunk to play while the request is in flight, which is a guaranteed
+        dropped deadline. exec_horizon == 0 selects that cap directly, which is
+        the degenerate no-soft-mask configuration.
+        """
+        h = self._chunk_len()
+        d = self._current_d()
+        latest = max(0, h - d)
+        if self._exec_horizon <= 0:
+            return latest
+        return max(1, min(self._exec_horizon, latest))
+
+    def _mask_regions(self) -> tuple[int, int, int]:
+        """(hard-frozen, soft-masked, free) action counts implied by the current s and d.
+
+        Soft-masked == 0 means RTC has nothing to smooth with: the new chunk is
+        pinned for d actions and then unconstrained, so the discontinuity simply
+        relocates to index d instead of index 0.
+        """
+        h = self._chunk_len() or 50
+        s = self._fire_index()
+        d = min(self._current_d(), h)
+        overlap = max(0, h - s)
+        hard = min(d, overlap)
+        return hard, max(0, overlap - hard), h - overlap
 
     def _publish(self, chunk: np.ndarray, offset: int):
         """Publish chunk[offset:] and record the bookkeeping _chunk_index needs."""
@@ -457,6 +496,12 @@ class OpenPIRTCNode(Node):
         # First inference of the episode: nothing to condition on, so no wire
         # fields, and nothing is executing yet so blocking here is free.
         print("  Priming chunk (no prev_actions)...")
+        if self._exec_horizon <= 0:
+            self.get_logger().warning(
+                "exec_horizon=0: firing at H-d, so the overlap equals d and the entire "
+                "overlap is hard-frozen -- RTC's soft-mask region is EMPTY and the "
+                "discontinuity just moves to index d. Use exec_horizon ~ H/2 (25)."
+            )
         t_req = time.monotonic()
         chunk = await loop.run_in_executor(None, self._fetch_chunk_sync, None, None)
         if chunk is None:
@@ -617,6 +662,12 @@ class OpenPIRTCNode(Node):
             print(f"    d observed  p50 {np.percentile(d, 50):.1f}   max {d.max()} steps"
                   f"   (d sent {self._current_d()}, firing at index {self._fire_index()} "
                   f"of {self._chunk_len()})")
+        hard, soft, free = self._mask_regions()
+        print(f"    RTC regions  hard-frozen {hard}  soft-masked {soft}  free {free}"
+              f"   (s={self._fire_index()}, H={self._chunk_len()})")
+        if soft == 0:
+            print("      ^ SOFT MASK IS EMPTY -- chunks are pinned then unconstrained, so")
+            print("        the discontinuity relocates rather than smooths. Lower exec_horizon.")
         if self._splice_jump_log:
             j = np.abs(np.array(self._splice_jump_log))   # (n_splices, 7)
             per_splice = j.max(axis=1)

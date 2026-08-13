@@ -44,6 +44,16 @@ def generate_launch_description():
                 description="Launch both front_1 and front_2 cameras (true) or only front_1",
             ),
             DeclareLaunchArgument(
+                "exec_horizon",
+                default_value="25",
+                description=(
+                    "s, actions played before the next inference fires. RTC's soft-mask "
+                    "region spans H-s-d actions, so s must be well below H-d or the mask "
+                    "is empty and chunks are pinned then unconstrained. Paper uses s~H/2 "
+                    "(H=50, s_min=25). 0 = fire at H-d (degenerate, comparison only)."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "rtc_d",
                 default_value="3",
                 description=(
@@ -187,6 +197,7 @@ def generate_launch_description():
                         "prompt": LaunchConfiguration("prompt"),
                         "num_episodes": LaunchConfiguration("num_episodes"),
                         "two_front_cameras": LaunchConfiguration("two_front_cameras"),
+                        "exec_horizon": LaunchConfiguration("exec_horizon"),
                         "rtc_d": LaunchConfiguration("rtc_d"),
                         "step_duration": LaunchConfiguration("step_duration"),
                         "send_prev_actions": LaunchConfiguration("send_prev_actions"),

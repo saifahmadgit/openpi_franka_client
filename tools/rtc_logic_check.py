@@ -93,6 +93,7 @@ node._prev_actions = np.zeros((H, W), np.float32)
 node._chunk_step_times = np.cumsum(np.r_[np.full(10, 0.5), np.full(40, 0.2)])
 node._chunk_offset = 0
 node._rtc_d = 3
+node._exec_horizon = 0        # section 3 asserts the H-d behaviour; 3b covers s
 node._chunk_pub_t = time.monotonic()
 check("t=0 -> index 0", node._chunk_index() == 0, f"got {node._chunk_index()}")
 node._chunk_pub_t = time.monotonic() - 5.0   # 10 stretched steps done
@@ -127,6 +128,29 @@ node._rtc_d = 3
 check("floor also overrides a pinned rtc_d", node._current_d() == 11, f"got {node._current_d()}")
 node._d_floor = 0
 check("d never exceeds H-1", node._current_d() <= H - 1)
+
+# ── 3b. execution horizon s and the RTC mask regions ─────────────────────────
+# Paper: [0,d) hard-frozen | [d, H-s) soft-masked | [H-s, H) free.
+# The soft mask spans H-s-d, so s=H-d makes it empty -- the bug this guards.
+print("\n3b. exec_horizon / mask regions")
+node._d_observed.clear()
+node._rtc_d = 7
+node._exec_horizon = 25
+check("fires at s, not H-d", node._fire_index() == 25, f"got {node._fire_index()}")
+hard, soft, free = node._mask_regions()
+check("regions with s=25,d=7: hard 7 / soft 18 / free 25",
+      (hard, soft, free) == (7, 18, 25), f"got {(hard, soft, free)}")
+check("regions sum to H", hard + soft + free == H)
+
+node._exec_horizon = 0                      # degenerate: fire at H-d
+check("exec_horizon=0 fires at H-d", node._fire_index() == H - 7, f"got {node._fire_index()}")
+hard0, soft0, free0 = node._mask_regions()
+check("...and the soft mask is EMPTY (the bug)", soft0 == 0, f"soft={soft0}")
+
+node._exec_horizon = 48                     # later than H-d: must be capped
+check("s capped at H-d so d steps always remain", node._fire_index() == H - 7,
+      f"got {node._fire_index()}")
+node._exec_horizon = 25
 
 # ── 4. splice offset: new[k] lines up with old[s_req + k] ────────────────────
 print("\n4. splice alignment")
