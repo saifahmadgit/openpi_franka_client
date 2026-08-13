@@ -44,7 +44,7 @@ ENFORCE_LIMITS = True
 # Base values are Franka's official per-joint max velocity / acceleration
 # (support.franka.de control_parameters), matching franka_fer_moveit_config
 # joint_limits.yaml. Start low, raise once stable.
-_LIMIT_SCALE = 0.1
+_LIMIT_SCALE = 0.5
 VEL_LIMIT = (
     np.array([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]) * _LIMIT_SCALE
 )  # rad/s
