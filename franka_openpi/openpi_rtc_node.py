@@ -43,6 +43,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
 
+from franka_openpi.robot_compliance import RobotCompliance
 from franka_openpi.rtc_executor import RTCExecutor
 
 
@@ -141,6 +142,18 @@ class OpenPIRTCNode(Node):
         # Escape hatch: run the streaming loop with no prev_actions on the wire, to
         # separate "streaming fixed it" from "RTC conditioning fixed it".
         self.declare_parameter("send_prev_actions", True)
+        # ── compliance ───────────────────────────────────────────────────────
+        # The arm is impedance-controlled by libfranka underneath the position
+        # interface; these soften it so contact with an obstacle yields instead of
+        # driving until the safety reflex trips. Empty list = leave the robot's
+        # current setting alone. See robot_compliance.py.
+        self.declare_parameter("joint_stiffness", [600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0])
+        self.declare_parameter("collision_torque", [40.0, 40.0, 38.0, 36.0, 32.0, 28.0, 24.0])
+        self.declare_parameter("collision_force", [40.0, 40.0, 40.0, 50.0, 50.0, 50.0])
+        # Clear a reflex and continue rather than letting it end the run. The arm
+        # ignores commands while in REFLEX, so without this a single collision
+        # silently stalls every remaining step of the episode.
+        self.declare_parameter("auto_error_recovery", True)
 
         host = self.get_parameter("server_host").value
         port = self.get_parameter("server_port").value
@@ -189,6 +202,12 @@ class OpenPIRTCNode(Node):
             step_duration=self._step_duration,
             enforce_limits=bool(self.get_parameter("enforce_limits").value),
         )
+
+        self.compliance_ = RobotCompliance(self)
+        self._auto_recover = bool(self.get_parameter("auto_error_recovery").value)
+        self._joint_stiffness = list(self.get_parameter("joint_stiffness").value or [])
+        self._collision_torque = list(self.get_parameter("collision_torque").value or [])
+        self._collision_force = list(self.get_parameter("collision_force").value or [])
 
         # ── RTC state (cleared on every episode reset) ───────────────────────
         self._prev_actions: np.ndarray | None = None  # verbatim (H, 14) server reply
@@ -464,6 +483,17 @@ class OpenPIRTCNode(Node):
         if not ok:
             return
 
+        # Compliance is applied after the controller is up but before any motion,
+        # and off the event loop because the service calls block. A failure here is
+        # not fatal: the arm simply keeps whatever stiffness it already had.
+        self.get_logger().info("Applying compliance settings...")
+        await loop.run_in_executor(
+            None,
+            lambda: self.compliance_.apply(
+                self._joint_stiffness, self._collision_torque, self._collision_force
+            ),
+        )
+
         self.get_logger().info("Waiting for camera images...")
         deadline = loop.time() + 10.0
         while (
@@ -488,6 +518,28 @@ class OpenPIRTCNode(Node):
             sampler.cancel()
             self.executor_.hold()
             await self.executor_.cancel_gripper_async()
+
+    async def _recover_and_reprime(self, loop) -> bool:
+        """Clear a reflex, then restart chunking from where the arm actually is.
+
+        The previous chunk cannot be resumed: the trajectory was dropped when the
+        reflex hit, and the arm is wherever it stopped rather than at the index the
+        step_times imply. Conditioning the next inference on that stale chunk would
+        splice against actions the arm never reached, so RTC state is cleared and a
+        fresh chunk is primed exactly as at episode start.
+        """
+        if not await loop.run_in_executor(None, self.compliance_.recover):
+            print("  ERROR: could not clear reflex -- ending episode.")
+            return False
+
+        self._reset_rtc_state()
+        chunk = await loop.run_in_executor(None, self._fetch_chunk_sync, None, None)
+        if chunk is None:
+            print("  ERROR: re-prime after reflex failed -- ending episode.")
+            return False
+        self._publish(chunk, offset=0)
+        self.get_logger().info("Re-primed after reflex; resuming.")
+        return True
 
     async def _run_episode(self):
         loop = asyncio.get_event_loop()
@@ -517,6 +569,15 @@ class OpenPIRTCNode(Node):
         steps_done = 0
         cycle = 0
         while steps_done < self.max_steps:
+            # A reflex leaves the arm stationary and ignoring the controller, but
+            # _chunk_index is driven by wall time, not feedback -- so without this
+            # check the loop keeps splicing chunks into an arm that is not moving,
+            # and the whole episode plays out as a stall.
+            if self._auto_recover and self.compliance_.in_reflex():
+                if not await self._recover_and_reprime(loop):
+                    break
+                continue
+
             h = self._chunk_len()
             fire_at = self._fire_index()
             # Where playback of the current chunk began. Everything from here to
@@ -679,6 +740,9 @@ class OpenPIRTCNode(Node):
             print("        what RTC removes -- with the server freezing new[0:d] it should")
             print("        fall toward 0. Compare this number before/after the server half.")
         print(f"    dropped deadlines: {self._dropped_deadlines}")
+        if self.compliance_.reflex_count:
+            print(f"    collision reflexes recovered: {self.compliance_.reflex_count}"
+                  f"   <- lower joint_stiffness or raise collision_torque")
         if self._d_violations:
             print(f"    frozen-region violations: {self._d_violations}  <- each one is a "
                   f"jerk; d is now floored at {self._d_floor}")

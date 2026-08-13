@@ -41,6 +41,12 @@ _log = rclpy.logging.get_logger("rtc_executor")
 
 TRAJECTORY_TOPIC = "/fer_arm_controller/joint_trajectory"
 
+# Ceiling on how long the catch-up segment may be stretched, in step_durations.
+# Uncapped, a large tracking error would stall the arm for seconds while it
+# creeps back onto the commanded path; the cap trades a small residual lurch on
+# the worst splices for bounded progress. See _time_parameterize.
+CATCHUP_MAX_STEPS = 4.0
+
 
 def _waypoint_velocities(knots: np.ndarray, times: np.ndarray) -> np.ndarray:
     """Central-difference joint velocities, zero at both ends.
@@ -87,6 +93,19 @@ def _time_parameterize(
     seg = np.diff(knots, axis=0)
 
     times = np.maximum(np.max(np.abs(seg) / v_max, axis=1), step_duration)
+
+    # Segment 0 spans measured position -> first commanded target, so it carries
+    # accumulated tracking error rather than one policy step of motion. Measured
+    # on a real run it is ~4x the distance of a normal step, and giving it the
+    # same step_duration as everything else makes the arm cover it at ~4x the
+    # policy's own speed: a lurch at every republish followed by a long crawl,
+    # which is what reads as "start and stop" at the arm. Size it by distance
+    # instead, so the catch-up happens at the speed of the motion around it.
+    if len(seg) > 1:
+        nominal = float(np.median(np.max(np.abs(seg[1:]), axis=1)))
+        if nominal > 1e-9:
+            n_steps = min(float(np.max(np.abs(seg[0]))) / nominal, CATCHUP_MAX_STEPS)
+            times[0] = max(times[0], step_duration * n_steps)
 
     for _ in range(max_iter):
         vel = _waypoint_velocities(knots, times)

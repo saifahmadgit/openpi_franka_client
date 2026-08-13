@@ -101,6 +101,37 @@ def generate_launch_description():
                 default_value="500",
                 description="Policy steps before the episode is cut off",
             ),
+            DeclareLaunchArgument(
+                "joint_stiffness",
+                default_value="[600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0]",
+                description=(
+                    "libfranka internal impedance, Nm/rad. Default there is "
+                    "[3000,3000,3000,2500,2500,2000,2000]; this is ~20%, so the arm "
+                    "yields on contact instead of driving until the reflex trips. "
+                    "'[]' leaves the robot's current setting alone."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "collision_torque",
+                default_value="[40.0, 40.0, 38.0, 36.0, 32.0, 28.0, 24.0]",
+                description=(
+                    "Per-joint reflex torque thresholds, Nm. Fills nominal and "
+                    "acceleration, upper and lower. Raise to tolerate more contact."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "collision_force",
+                default_value="[40.0, 40.0, 40.0, 50.0, 50.0, 50.0]",
+                description="Cartesian reflex force/torque thresholds (x y z r p y).",
+            ),
+            DeclareLaunchArgument(
+                "auto_error_recovery",
+                default_value="true",
+                description=(
+                    "Clear a reflex and re-prime instead of stalling. The arm ignores "
+                    "commands in REFLEX, so without this one collision wastes the run."
+                ),
+            ),
             # Prepend venv site-packages so /usr/bin/python3 can import openpi_client.
             SetEnvironmentVariable(
                 name="PYTHONPATH",
@@ -204,6 +235,16 @@ def generate_launch_description():
                         "rtc_d_margin": LaunchConfiguration("rtc_d_margin"),
                         "image_size": LaunchConfiguration("image_size"),
                         "max_steps": LaunchConfiguration("max_steps"),
+                        "joint_stiffness": ParameterValue(
+                            LaunchConfiguration("joint_stiffness"), value_type=None
+                        ),
+                        "collision_torque": ParameterValue(
+                            LaunchConfiguration("collision_torque"), value_type=None
+                        ),
+                        "collision_force": ParameterValue(
+                            LaunchConfiguration("collision_force"), value_type=None
+                        ),
+                        "auto_error_recovery": LaunchConfiguration("auto_error_recovery"),
                         "debug_tag": "rtc_sim",
                     }
                 ],
