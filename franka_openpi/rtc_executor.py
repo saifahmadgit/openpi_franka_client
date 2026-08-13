@@ -43,24 +43,27 @@ TRAJECTORY_TOPIC = "/fer_arm_controller/joint_trajectory"
 
 
 def _waypoint_velocities(knots: np.ndarray, times: np.ndarray) -> np.ndarray:
-    """Central-difference joint velocities, with the last waypoint left moving.
+    """Central-difference joint velocities, zero at both ends.
 
-    action_executor's version zeroes velocity at BOTH ends, which is correct for
-    a self-contained rest-to-rest goal and fatal for streaming: it bakes a full
-    stop into the end of every chunk. Here only the start is pinned (the arm is
-    genuinely at rest relative to the new trajectory's first segment); the final
-    waypoint keeps the speed of the segment leading into it, so a chunk that gets
-    replaced mid-flight hands over at a matching velocity.
+    Identical to action_executor's version, and it MUST stay that way: a
+    trajectory whose final point carries a non-zero velocity is silently
+    discarded by fer_arm_controller. Measured on hardware -- same 50 points, same
+    ramp, only the terminal element differing:
 
-    If a chunk is NOT replaced in time, JTC simply holds the final point once the
-    trajectory runs out -- a non-zero terminal velocity is not extrapolated, so
-    this cannot run the arm away.
+        terminal |vel| = 0.000  ->  joint 7 moved +0.0706 of 0.080 commanded
+        terminal |vel| = 0.008  ->  joint 7 moved +0.0004  (nothing)
+
+    An earlier version of this file left the last waypoint moving, reasoning that
+    zeroing it bakes a full stop into every chunk boundary. That reasoning was
+    wrong for this pipeline: the stall is avoided by REPLACING the trajectory
+    before the arm reaches the end (publish_chunk overwrites at index H-d), so
+    the decelerating tail is never executed and its velocity value never matters.
+    The only thing the non-zero terminal velocity achieved was to stop every
+    trajectory from being accepted at all.
     """
     vel = np.zeros_like(knots)
     for k in range(1, len(knots) - 1):
         vel[k] = (knots[k + 1] - knots[k - 1]) / (times[k - 1] + times[k])
-    if len(knots) >= 2:
-        vel[-1] = (knots[-1] - knots[-2]) / times[-1]
     return vel
 
 

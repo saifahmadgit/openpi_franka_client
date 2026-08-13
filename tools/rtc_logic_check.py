@@ -72,13 +72,18 @@ def check(label, cond, extra=""):
 
 # ── 1. terminal velocity is NOT zeroed (the rest-to-rest bug) ─────────────────
 print("\n1. streaming _waypoint_velocities")
+# Terminal velocity MUST be zero: fer_arm_controller silently discards any
+# trajectory whose last point carries velocity. Measured on hardware --
+# terminal 0.000 -> joint 7 moved +0.0706 of 0.080; terminal 0.008 -> nothing.
 knots = np.cumsum(np.ones((6, 7)) * 0.05, axis=0)
 times = np.full(5, 0.2)
 v = rtc_executor._waypoint_velocities(knots, times)
-check("last waypoint keeps velocity", np.abs(v[-1]).max() > 1e-6, f"|v[-1]|={np.abs(v[-1]).max():.4f}")
+check("terminal velocity is ZERO (JTC discards it otherwise)",
+      np.abs(v[-1]).max() < 1e-12, f"|v[-1]|={np.abs(v[-1]).max():.6f}")
+check("interior waypoints still carry velocity", np.abs(v[1:-1]).max() > 1e-6)
 from franka_openpi import action_executor
 v_old = action_executor._waypoint_velocities(knots, times)
-check("action_executor still zeroes it (unchanged)", np.abs(v_old[-1]).max() < 1e-12)
+check("matches action_executor exactly", np.allclose(v, v_old))
 
 # ── 2. time -> chunk index through non-uniform step_times ────────────────────
 print("\n2. _chunk_index mapping")
