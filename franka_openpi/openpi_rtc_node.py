@@ -187,7 +187,7 @@ class OpenPIRTCNode(Node):
         self._server_infer_log: list[float] = []      # server_timing.infer_ms
         self._policy_infer_log: list[float] = []      # policy_timing.infer_ms (dispatch only)
         self._d_observed: deque = deque(maxlen=20)
-        self._d_floor = 0          # ratchets up on any frozen-region violation
+        self._d_floor = 0          # ratchets up on a frozen-region violation or a missed deadline
         self._d_violations = 0
         self._dropped_deadlines = 0
         self._actual_log: list[np.ndarray] = []
@@ -465,11 +465,18 @@ class OpenPIRTCNode(Node):
                 if not warned and self._chunk_index() >= h:
                     warned = True
                     self._dropped_deadlines += 1
+                    # Widen d here too, not only on a frozen-region violation.
+                    # _chunk_index saturates at h, so once the chunk runs dry
+                    # d_actual clamps to d_sent and the check below can never
+                    # fire -- leaving adaptive mode stuck at a d that misses
+                    # every deadline. This is the only ratchet that fires when
+                    # the reply lands after the chunk is already exhausted.
+                    self._d_floor = d_sent + self._d_margin
                     self.get_logger().warning(
                         f"DROPPED DEADLINE: chunk exhausted at index {h} with inference "
                         f"still in flight ({time.monotonic() - t_req:.2f}s so far). Arm is "
-                        f"holding the last action. Increase rtc_d (currently fires at "
-                        f"{fire_at}) or reduce round-trip latency."
+                        f"holding the last action. Raising d to >= {self._d_floor} "
+                        f"(was firing at index {fire_at} with d={d_sent})."
                     )
 
             new_chunk = task.result()
