@@ -436,9 +436,14 @@ class OpenPIRTCNode(Node):
         self._publish(chunk, offset=0)
 
         steps_done = 0
+        cycle = 0
         while steps_done < self.max_steps:
             h = self._chunk_len()
             fire_at = self._fire_index()
+            # Where playback of the current chunk began. Everything from here to
+            # the index reached at reply time is motion the arm actually executed,
+            # which is what max_steps is meant to bound.
+            played_from = self._chunk_offset
 
             # 1. Play out the chunk until index H - d.
             while self._chunk_index() < fire_at:
@@ -514,7 +519,17 @@ class OpenPIRTCNode(Node):
                 d_actual = len(new_chunk) - 1
             self._publish(new_chunk, offset=int(d_actual))
 
-            steps_done += max(d_actual, 1)
+            # Count what was PLAYED this cycle, not the splice offset. d_actual is
+            # only the few steps consumed while inference was in flight (~3-5);
+            # the arm also played everything from played_from up to the fire index,
+            # so counting d_actual alone overruns max_steps by roughly 10x.
+            steps_done += max(s_reply - played_from, 1)
+            cycle += 1
+            print(
+                f"  [{cycle:3d}] played {s_reply - played_from:2d} steps "
+                f"({steps_done}/{self.max_steps})  rtt {rtt * 1e3:4.0f} ms  "
+                f"d={d_sent} (actual {d_actual})  resume at {d_actual}/{len(new_chunk)}"
+            )
 
     async def _sample_actual(self):
         """Record measured joints on a fixed tick, for the post-episode plot.
