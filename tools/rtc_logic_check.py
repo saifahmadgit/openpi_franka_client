@@ -54,6 +54,8 @@ _ws_client = _mod("websockets.sync.client", ClientConnection=object, connect=lam
 _ws_sync = _mod("websockets.sync", client=_ws_client)
 _mod("websockets", sync=_ws_sync)
 _mod("openpi_client", msgpack_numpy=_mod("openpi_client.msgpack_numpy"),
+     image_tools=_mod("openpi_client.image_tools",
+                      resize_with_pad=lambda im, h, w: im),
      websocket_client_policy=_mod("openpi_client.websocket_client_policy",
                                   WebsocketClientPolicy=object))
 
@@ -103,15 +105,23 @@ node._chunk_pub_t = time.monotonic() - 5.0
 check("offset shifts the index", node._chunk_index() == 17, f"got {node._chunk_index()}")
 
 # ── 3. fire index ────────────────────────────────────────────────────────────
-print("\n3. _fire_index")
+print("\n3. _fire_index / _current_d")
 node._chunk_offset = 0
 node._d_observed = __import__("collections").deque(maxlen=20)
+node._d_floor = 0
+node._d_margin = 2
 check("rtc_d=3 -> fire at 47", node._fire_index() == 47, f"got {node._fire_index()}")
 node._rtc_d = 0
 check("adaptive with no history -> d=3", node._fire_index() == 47, f"got {node._fire_index()}")
 node._d_observed.extend([2, 3, 5, 2])
-check("adaptive sizes off the tail (max 5 +1)", node._fire_index() == 44, f"got {node._fire_index()}")
+check("adaptive sizes off the TAIL not the median (max 5 + margin 2 = 7)",
+      node._current_d() == 7 and node._fire_index() == 43, f"d={node._current_d()}")
+node._d_floor = 11
+check("_d_floor ratchet wins once set", node._current_d() == 11, f"got {node._current_d()}")
 node._rtc_d = 3
+check("floor also overrides a pinned rtc_d", node._current_d() == 11, f"got {node._current_d()}")
+node._d_floor = 0
+check("d never exceeds H-1", node._current_d() <= H - 1)
 
 # ── 4. splice offset: new[k] lines up with old[s_req + k] ────────────────────
 print("\n4. splice alignment")
@@ -131,27 +141,46 @@ sent = {}
 class FakePolicy:
     def infer(self, obs):
         sent.update(obs)
-        return {"actions": new}
+        return {"actions": new,
+                "server_timing": {"infer_ms": 180.0},
+                "policy_timing": {"infer_ms": 11.0}}
 node.policy = FakePolicy()
 node._two_front_cameras = False
 node.front1_image = np.zeros((3, 4, 4), np.uint8)
 node.wrist_image = np.zeros((3, 4, 4), np.uint8)
 node._raw_joints = np.arange(9, dtype=float)
 node.prompt = "p"
-out = node._fetch_chunk_sync(old, 47)
+node._server_infer_log = []
+node._policy_infer_log = []
+out = node._fetch_chunk_sync(old, 47, 5)
 check("prev_actions present", "prev_actions" in sent)
 check("prev_actions shape (50,14) — NOT sliced to 8",
       sent["prev_actions"].shape == (H, W), f"got {sent['prev_actions'].shape}")
 check("prev_actions bitwise identical to what infer returned",
       np.array_equal(sent["prev_actions"], old))
 check("prev_actions_start is a plain int", isinstance(sent["prev_actions_start"], int))
+check("prev_actions_d sent as plain int",
+      sent.get("prev_actions_d") == 5 and isinstance(sent["prev_actions_d"], int))
 check("state is 9-dim float32", sent["state"].shape == (9,) and sent["state"].dtype == np.float32)
 check("returned chunk kept at full width", out.shape == (H, W), f"got {out.shape}")
+check("server_timing.infer_ms recorded", node._server_infer_log == [180.0])
+check("policy_timing.infer_ms recorded separately", node._policy_infer_log == [11.0])
 
-# first call of an episode omits both keys
+# first call of an episode omits all three keys
 sent.clear()
-node._fetch_chunk_sync(None, None)
-check("omitted on first inference", "prev_actions" not in sent and "prev_actions_start" not in sent)
+node._fetch_chunk_sync(None, None, None)
+check("all three omitted on first inference",
+      not {"prev_actions", "prev_actions_start", "prev_actions_d"} & set(sent))
+
+# image path: default (image_size=0) must be byte-identical to the existing node
+print("\n5b. image path")
+node._image_size = 0
+class _Msg: pass
+raw_hwc = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+node.bridge = types.SimpleNamespace(imgmsg_to_cv2=lambda m, e: raw_hwc)
+chw = node._proc_image(_Msg())
+check("default sends full-res CHW, unchanged", chw.shape == (3, 480, 640), f"got {chw.shape}")
+check("pixels untouched at image_size=0", np.array_equal(chw, raw_hwc.transpose(2, 0, 1)))
 
 # ── 6. episode reset clears both ─────────────────────────────────────────────
 print("\n6. reset")

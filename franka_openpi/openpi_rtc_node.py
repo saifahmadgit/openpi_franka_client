@@ -38,7 +38,7 @@ import numpy as np
 import rclpy
 import websockets.sync.client
 from cv_bridge import CvBridge
-from openpi_client import msgpack_numpy, websocket_client_policy
+from openpi_client import image_tools, msgpack_numpy, websocket_client_policy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
@@ -103,9 +103,28 @@ class OpenPIRTCNode(Node):
         # recorded at 30 fps, so this is the knob to walk toward 1/30 separately.
         self.declare_parameter("step_duration", 0.2)
         # d, the inference latency in control steps: fire the next request at
-        # index H - d. 0 = adapt from observed round trips (see _fire_index).
+        # index H - d, and tell the server to freeze that many actions. 0 = adapt
+        # from observed round trips. See _current_d for why this is sized off the
+        # tail rather than the median.
         self.declare_parameter("rtc_d", 3)
+        # Extra steps added on top of the worst d seen so far. The splice index
+        # must never exceed the frozen region, so this is pure safety margin.
+        self.declare_parameter("rtc_d_margin", 2)
         self.declare_parameter("enforce_limits", True)
+        # Optional client-side downscale before sending. OFF by default: the
+        # server already resizes, which is why full-resolution frames have always
+        # worked. This is a bandwidth optimisation only (2.77 MB -> 0.45 MB, most
+        # of the measured round trip), NOT a correctness fix.
+        #
+        # It is only safe if the server resizes to this same size with
+        # image_tools.resize_with_pad, in which case its own call short-circuits
+        # (resize_with_pad returns early when the image is already the target
+        # size) and the model input is unchanged. If the server's transform
+        # differs in size or method, enabling this stacks two resamples and
+        # silently shifts the input distribution. Confirm server-side before
+        # setting it. Use resize_with_pad rather than a plain resize either way:
+        # 640x480 -> 224x168 centred in 224x224, aspect preserved.
+        self.declare_parameter("image_size", 0)
         # Escape hatch: run the streaming loop with no prev_actions on the wire, to
         # separate "streaming fixed it" from "RTC conditioning fixed it".
         self.declare_parameter("send_prev_actions", True)
@@ -117,7 +136,9 @@ class OpenPIRTCNode(Node):
         self._two_front_cameras = bool(self.get_parameter("two_front_cameras").value)
         self._step_duration = float(self.get_parameter("step_duration").value)
         self._rtc_d = int(self.get_parameter("rtc_d").value)
+        self._d_margin = int(self.get_parameter("rtc_d_margin").value)
         self._send_prev = bool(self.get_parameter("send_prev_actions").value)
+        self._image_size = int(self.get_parameter("image_size").value)
         tag = self.get_parameter("debug_tag").value
         self._debug_prefix = f"{tag}_" if tag else ""
 
@@ -163,7 +184,11 @@ class OpenPIRTCNode(Node):
 
         # ── diagnostics ──────────────────────────────────────────────────────
         self._rtt_log: list[float] = []
+        self._server_infer_log: list[float] = []      # server_timing.infer_ms
+        self._policy_infer_log: list[float] = []      # policy_timing.infer_ms (dispatch only)
         self._d_observed: deque = deque(maxlen=20)
+        self._d_floor = 0          # ratchets up on any frozen-region violation
+        self._d_violations = 0
         self._dropped_deadlines = 0
         self._actual_log: list[np.ndarray] = []
         self._actual_time_log: list[float] = []
@@ -174,8 +199,17 @@ class OpenPIRTCNode(Node):
     # ── callbacks ────────────────────────────────────────────────────────
 
     def _proc_image(self, msg) -> np.ndarray:
-        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")
-        return np.ascontiguousarray(img.transpose(2, 0, 1))  # CHW (3, 480, 640)
+        """ROS Image -> CHW uint8, matching openpi_client_node byte for byte.
+
+        With image_size == 0 (the default) this is exactly what the existing
+        pipeline sends: full-resolution CHW, resized server-side. The optional
+        downscale runs in HWC, because resize_with_pad expects [..., H, W, C];
+        the transpose to CHW happens after either way.
+        """
+        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")  # HWC
+        if self._image_size > 0:
+            img = image_tools.resize_with_pad(img, self._image_size, self._image_size)
+        return np.ascontiguousarray(img.transpose(2, 0, 1))  # CHW
 
     def _front1_cb(self, msg):
         self.front1_image = self._proc_image(msg)
@@ -222,12 +256,18 @@ class OpenPIRTCNode(Node):
         }
 
     def _fetch_chunk_sync(
-        self, prev_actions: np.ndarray | None, prev_start: int | None
+        self,
+        prev_actions: np.ndarray | None,
+        prev_start: int | None,
+        prev_d: int | None = None,
     ) -> np.ndarray | None:
         """One blocking infer(), run on a worker thread. Returns the chunk VERBATIM.
 
         The reply is not sliced, rebased, or converted here. Whatever width the
         server sends is what gets stored and what goes back on the next call.
+
+        All three RTC keys travel together and are omitted together, so the server
+        sees either a complete previous-chunk context or none at all.
         """
         obs = self._get_observation()
         if obs is None:
@@ -235,12 +275,30 @@ class OpenPIRTCNode(Node):
         if prev_actions is not None and prev_start is not None:
             obs["prev_actions"] = prev_actions
             obs["prev_actions_start"] = int(prev_start)
+            obs["prev_actions_d"] = int(prev_d)
         try:
             result = self.policy.infer(obs)
+            self._record_timing(result)
             return np.asarray(result["actions"], dtype=np.float32)
         except Exception as e:
             self.get_logger().error(f"Infer request failed: {e}")
             return None
+
+    def _record_timing(self, result: dict):
+        """Keep server_timing beside policy_timing.
+
+        policy_timing.infer_ms times JAX *dispatch*, not execution -- JAX is async
+        and the computation does not block until the result is converted back to
+        numpy, outside that timer. server_timing.infer_ms wraps the whole
+        policy.infer and is the honest number. Logging both makes the gap visible
+        rather than something to rediscover later.
+        """
+        srv = result.get("server_timing", {}) or {}
+        pol = result.get("policy_timing", {}) or {}
+        if "infer_ms" in srv:
+            self._server_infer_log.append(float(srv["infer_ms"]))
+        if "infer_ms" in pol:
+            self._policy_infer_log.append(float(pol["infer_ms"]))
 
     # ── chunk bookkeeping ────────────────────────────────────────────────
 
@@ -262,23 +320,28 @@ class OpenPIRTCNode(Node):
     def _chunk_len(self) -> int:
         return 0 if self._prev_actions is None else len(self._prev_actions)
 
-    def _fire_index(self) -> int:
-        """Chunk index at which to launch the next inference: H - d.
+    def _current_d(self) -> int:
+        """d: how many actions the server freezes, and how early we fire.
 
-        rtc_d > 0 pins d. rtc_d == 0 adapts it from the d actually observed on
-        recent round trips, sized off the tail (max of the recent window plus a
-        step of margin) -- a single slow call is what produces a visible jerk, so
-        the mean is the wrong statistic.
+        Sized off the TAIL, never the median. The splice index (s_reply - s_req)
+        must not exceed d: past that the client resumes inside actions the server
+        never froze, which reintroduces exactly the discontinuity RTC removes --
+        intermittently, and only on slow calls, which is the hardest form to
+        diagnose. _d_floor ratchets up whenever that is observed, so a single
+        violation permanently widens the margin for the rest of the run.
         """
-        h = self._chunk_len()
+        h = self._chunk_len() or 50
         if self._rtc_d > 0:
-            d = self._rtc_d
+            d = max(self._rtc_d, self._d_floor)
         elif self._d_observed:
-            d = int(max(self._d_observed)) + 1
+            d = max(int(max(self._d_observed)) + self._d_margin, self._d_floor)
         else:
-            d = 3
-        d = int(np.clip(d, 1, max(1, h - 1)))
-        return max(0, h - d)
+            d = max(3, self._d_floor)
+        return int(np.clip(d, 1, max(1, h - 1)))
+
+    def _fire_index(self) -> int:
+        """Chunk index at which to launch the next inference: H - d."""
+        return max(0, self._chunk_len() - self._current_d())
 
     def _publish(self, chunk: np.ndarray, offset: int):
         """Publish chunk[offset:] and record the bookkeeping _chunk_index needs."""
@@ -382,12 +445,15 @@ class OpenPIRTCNode(Node):
                 await asyncio.sleep(self._step_duration / 4)
 
             # 2. Fire the next inference. The arm keeps moving through the tail.
+            #    d_sent is the freeze width the server will use, and must be the
+            #    same d that chose fire_at -- read once so they cannot diverge.
+            d_sent = self._current_d()
             s_req = self._chunk_index()
             t_req = time.monotonic()
             prev = self._prev_actions if self._send_prev else None
             start = s_req if self._send_prev else None
             task = asyncio.ensure_future(
-                loop.run_in_executor(None, self._fetch_chunk_sync, prev, start)
+                loop.run_in_executor(None, self._fetch_chunk_sync, prev, start, d_sent)
             )
 
             # 3. Wait for it without blocking the arm, and notice if we run out
@@ -419,6 +485,20 @@ class OpenPIRTCNode(Node):
             s_reply = self._chunk_index()
             d_actual = s_reply - s_req
             self._d_observed.append(d_actual)
+
+            # The server froze new_chunk[0:d_sent]. Splicing at d_actual > d_sent
+            # resumes inside actions that were never pinned to the old chunk --
+            # the discontinuity RTC exists to remove, reappearing only on slow
+            # calls. Ratchet d up so it cannot recur at this latency.
+            if self._send_prev and d_actual > d_sent:
+                self._d_violations += 1
+                self._d_floor = d_actual + self._d_margin
+                self.get_logger().error(
+                    f"FROZEN REGION EXCEEDED: spliced at {d_actual} but only {d_sent} "
+                    f"actions were frozen (rtt {rtt * 1e3:.0f} ms). Expect a jerk here. "
+                    f"Raising d to >= {self._d_floor} for the rest of the run."
+                )
+
             if d_actual >= len(new_chunk):
                 self.get_logger().error(
                     f"Inference consumed the whole chunk (d={d_actual} >= H="
@@ -456,11 +536,23 @@ class OpenPIRTCNode(Node):
             print(f"    round trip  p50 {np.percentile(rtt, 50):.0f} ms   "
                   f"p95 {np.percentile(rtt, 95):.0f} ms   max {rtt.max():.0f} ms "
                   f"({len(rtt)} calls)")
+        if self._server_infer_log:
+            s = np.array(self._server_infer_log)
+            print(f"    server_timing.infer_ms  p50 {np.percentile(s, 50):.0f}   "
+                  f"p95 {np.percentile(s, 95):.0f}   <- real model time")
+        if self._policy_infer_log:
+            p = np.array(self._policy_infer_log)
+            print(f"    policy_timing.infer_ms  p50 {np.percentile(p, 50):.0f}   "
+                  f"(JAX dispatch only -- not execution; expect it to read far low)")
         if self._d_observed:
             d = np.array(self._d_observed)
             print(f"    d observed  p50 {np.percentile(d, 50):.1f}   max {d.max()} steps"
-                  f"   (firing at index {self._fire_index()} of {self._chunk_len()})")
+                  f"   (d sent {self._current_d()}, firing at index {self._fire_index()} "
+                  f"of {self._chunk_len()})")
         print(f"    dropped deadlines: {self._dropped_deadlines}")
+        if self._d_violations:
+            print(f"    frozen-region violations: {self._d_violations}  <- each one is a "
+                  f"jerk; d is now floored at {self._d_floor}")
         if self._dropped_deadlines:
             print("    ^ raise rtc_d, or shrink the observation payload; each one is a "
                   "visible stall")

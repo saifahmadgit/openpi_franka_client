@@ -61,6 +61,24 @@ def generate_launch_description():
                 ),
             ),
             DeclareLaunchArgument(
+                "rtc_d_margin",
+                default_value="2",
+                description=(
+                    "Steps added on top of the worst observed d. The splice index must "
+                    "never exceed the server's frozen region, so this is safety margin."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "image_size",
+                default_value="0",
+                description=(
+                    "0 = send full resolution (current behaviour; the server resizes). "
+                    "224 pre-resizes with resize_with_pad to cut the payload 2.77MB->0.45MB "
+                    "-- only enable once the server is confirmed to resize to the same "
+                    "size with the same function, or you stack two resamples."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "send_prev_actions",
                 default_value="true",
                 description=(
@@ -170,6 +188,8 @@ def generate_launch_description():
                         "rtc_d": LaunchConfiguration("rtc_d"),
                         "step_duration": LaunchConfiguration("step_duration"),
                         "send_prev_actions": LaunchConfiguration("send_prev_actions"),
+                        "rtc_d_margin": LaunchConfiguration("rtc_d_margin"),
+                        "image_size": LaunchConfiguration("image_size"),
                         "max_steps": LaunchConfiguration("max_steps"),
                         "debug_tag": "rtc",
                     }
