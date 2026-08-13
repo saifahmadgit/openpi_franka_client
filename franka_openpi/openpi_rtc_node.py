@@ -186,6 +186,9 @@ class OpenPIRTCNode(Node):
         self._rtt_log: list[float] = []
         self._server_infer_log: list[float] = []      # server_timing.infer_ms
         self._policy_infer_log: list[float] = []      # policy_timing.infer_ms (dispatch only)
+        self._commanded_log: list[dict] = []   # per publish: t, offset, step_times, actions
+        self._splice_jump_log: list[np.ndarray] = []  # (7,) target jump at each splice
+        self._splice_meta: list[tuple] = []
         self._d_observed: deque = deque(maxlen=20)
         self._d_floor = 0          # ratchets up on a frozen-region violation or a missed deadline
         self._d_violations = 0
@@ -284,6 +287,23 @@ class OpenPIRTCNode(Node):
             self.get_logger().error(f"Infer request failed: {e}")
             return None
 
+    def _measure_splice(self, new_chunk: np.ndarray, s_req: int, s_reply: int, d_actual: int):
+        """Record the target jump at a splice, per joint and as a max.
+
+        Indices are clamped because _chunk_index saturates at the chunk length:
+        when a deadline is dropped s_reply sits exactly at H and there is no
+        old[H] to compare against, so the last real action is used instead.
+        """
+        if self._prev_actions is None:
+            return
+        i_old = int(np.clip(s_reply, 0, len(self._prev_actions) - 1))
+        i_new = int(np.clip(d_actual, 0, len(new_chunk) - 1))
+        jump = np.asarray(new_chunk[i_new, :7], dtype=float) - np.asarray(
+            self._prev_actions[i_old, :7], dtype=float
+        )
+        self._splice_jump_log.append(jump)
+        self._splice_meta.append((s_req, s_reply, d_actual, i_old, i_new))
+
     def _record_timing(self, result: dict):
         """Keep server_timing beside policy_timing.
 
@@ -353,6 +373,20 @@ class OpenPIRTCNode(Node):
         self._chunk_step_times = step_times
         self._chunk_pub_t = t_pub
         self._chunk_offset = offset
+
+        # Commanded targets on a wall-clock timeline: action i of this publish is
+        # reached at t_pub + step_times[i]. Recorded for every publish, including
+        # the tail steps that get overwritten -- the analysis needs both what was
+        # commanded and what was actually reached before replacement.
+        if self._t0 is not None:
+            self._commanded_log.append(
+                {
+                    "t": t_pub - self._t0,
+                    "offset": int(offset),
+                    "step_times": step_times.astype(np.float32),
+                    "actions": np.asarray(chunk[offset:, :8], dtype=np.float32),
+                }
+            )
 
     def _reset_rtc_state(self):
         """Episode boundary: forget the previous chunk entirely.
@@ -511,6 +545,18 @@ class OpenPIRTCNode(Node):
                     f"Raising d to >= {self._d_floor} for the rest of the run."
                 )
 
+            # Splice discontinuity: old_chunk[s_reply] and new_chunk[d_actual] name
+            # the SAME instant -- the first action commanded from the new chunk is
+            # the one that replaces old[s_reply]. Their difference is the step
+            # change in target the arm sees at the splice, in radians.
+            #
+            # This is the quantity RTC removes: with the server freezing
+            # new[0:d] to prev[start:start+d], new[d_actual] is pinned to
+            # old[s_req + d_actual] = old[s_reply] and the jump goes to ~0. Until
+            # then the two chunks are independent samples and this measures how
+            # far apart they land.
+            self._measure_splice(new_chunk, s_req, s_reply, d_actual)
+
             if d_actual >= len(new_chunk):
                 self.get_logger().error(
                     f"Inference consumed the whole chunk (d={d_actual} >= H="
@@ -571,6 +617,16 @@ class OpenPIRTCNode(Node):
             print(f"    d observed  p50 {np.percentile(d, 50):.1f}   max {d.max()} steps"
                   f"   (d sent {self._current_d()}, firing at index {self._fire_index()} "
                   f"of {self._chunk_len()})")
+        if self._splice_jump_log:
+            j = np.abs(np.array(self._splice_jump_log))   # (n_splices, 7)
+            per_splice = j.max(axis=1)
+            print(f"    splice jump  p50 {np.percentile(per_splice, 50):.4f}   "
+                  f"p95 {np.percentile(per_splice, 95):.4f}   max {per_splice.max():.4f} rad"
+                  f"   ({len(per_splice)} splices)")
+            print(f"      per-joint mean |jump|: {np.round(j.mean(axis=0), 4).tolist()}")
+            print("      ^ step change in commanded target at each chunk handover. This is")
+            print("        what RTC removes -- with the server freezing new[0:d] it should")
+            print("        fall toward 0. Compare this number before/after the server half.")
         print(f"    dropped deadlines: {self._dropped_deadlines}")
         if self._d_violations:
             print(f"    frozen-region violations: {self._d_violations}  <- each one is a "
@@ -588,6 +644,22 @@ class OpenPIRTCNode(Node):
         if self._rtt_log:
             np.save(os.path.join(self._debug_dir, self._debug_prefix + "rtt.npy"),
                     np.array(self._rtt_log))
+        if self._splice_jump_log:
+            np.save(os.path.join(self._debug_dir, self._debug_prefix + "splice_jumps.npy"),
+                    np.array(self._splice_jump_log))
+            np.save(os.path.join(self._debug_dir, self._debug_prefix + "splice_meta.npy"),
+                    np.array(self._splice_meta))
+        if self._commanded_log:
+            # Ragged across publishes (the tail shortens as d grows), so npz with
+            # one entry per publish rather than a single stacked array.
+            flat = {}
+            for k, rec in enumerate(self._commanded_log):
+                flat[f"t_{k}"] = np.float32(rec["t"])
+                flat[f"offset_{k}"] = np.int32(rec["offset"])
+                flat[f"step_times_{k}"] = rec["step_times"]
+                flat[f"actions_{k}"] = rec["actions"]
+            np.savez(os.path.join(self._debug_dir, self._debug_prefix + "commanded.npz"),
+                     n_publishes=np.int32(len(self._commanded_log)), **flat)
         print(f"  [RTC] logs -> {self._debug_dir}")
 
 

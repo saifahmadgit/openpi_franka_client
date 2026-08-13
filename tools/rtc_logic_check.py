@@ -187,6 +187,34 @@ chw = node._proc_image(_Msg())
 check("default sends full-res CHW, unchanged", chw.shape == (3, 480, 640), f"got {chw.shape}")
 check("pixels untouched at image_size=0", np.array_equal(chw, raw_hwc.transpose(2, 0, 1)))
 
+# ── 5c. splice discontinuity measurement ─────────────────────────────────────
+print("\n5c. splice jump")
+node._splice_jump_log = []
+node._splice_meta = []
+node._prev_actions = old
+s_req, s_reply = 45, 48
+d_actual = s_reply - s_req
+node._measure_splice(new, s_req, s_reply, d_actual)
+got = node._splice_jump_log[0]
+want = new[d_actual, :7] - old[s_reply, :7]
+check("jump = new[d_actual] - old[s_reply]", np.allclose(got, want))
+check("jump is per-joint (7,)", got.shape == (7,), f"got {got.shape}")
+
+# What the server freezing new[0:d] to prev[start:start+d] should produce.
+frozen = new.copy()
+n_freeze = H - s_req                          # d_eff: all that exists past s_req
+frozen[:n_freeze, :] = old[s_req:s_req + n_freeze, :]
+node._splice_jump_log = []
+node._measure_splice(frozen, s_req, s_reply, d_actual)
+check("goes to ~0 once the server freezes the region",
+      np.abs(node._splice_jump_log[0]).max() < 1e-6,
+      f"max {np.abs(node._splice_jump_log[0]).max():.2e}")
+
+# saturated index (dropped deadline): s_reply == H, no old[H] to compare
+node._splice_jump_log = []
+node._measure_splice(new, 45, H, H - 45)
+check("clamps safely when s_reply saturates at H", len(node._splice_jump_log) == 1)
+
 # ── 6. episode reset clears both ─────────────────────────────────────────────
 print("\n6. reset")
 node._prev_actions = old
