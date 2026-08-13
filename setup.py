@@ -14,6 +14,8 @@ setup(
             'launch/openpi_franka.launch.xml',
             'launch/openpi_franka.launch.py',
             'launch/openpi_franka.launch_sim.py',
+            'launch/openpi_franka_RTC.launch.py',
+            'launch/openpi_franka_RTC.launch_sim.py',
             'launch/act_franka.launch.py',
             'launch/groot_franka.launch.py',
             'launch/camera_launcher.launch.py',
@@ -33,6 +35,7 @@ setup(
     entry_points={
         'console_scripts': [
             'openpi_client_node = franka_openpi.openpi_client_node:main',
+            'openpi_rtc_node = franka_openpi.openpi_rtc_node:main',
             'groot_client_node = franka_openpi.groot_client_node:main',
             'act_client_node = franka_openpi.act_client_node:main',
             'hand_eye_calibrate = franka_openpi.hand_eye_calibrate:main',

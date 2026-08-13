@@ -1,0 +1,27 @@
+{
+  "host": "129.105.69.11",
+  "port": 8000,
+  "n": 30,
+  "warmup": 2,
+  "two_front_cameras": true,
+  "synthetic": true,
+  "refresh_obs": false,
+  "step_hz": 5.0,
+  "horizon": 50,
+  "prompt": "pick up the cracker box",
+  "total_ms": {
+    "min": 366.73269099992467,
+    "p50": 432.8935614994407,
+    "p95": 509.6885377999569,
+    "p99": 519.9576646998139,
+    "max": 520.8007729997917,
+    "mean": 434.22863563343225,
+    "std": 47.23564453611269
+  },
+  "server_infer_ms": {
+    "p50": 11.53468620032072,
+    "p95": 43.40112921781838
+  },
+  "bytes_sent": 2765121,
+  "bytes_recv": 5743
+}
