@@ -39,6 +39,7 @@ import rclpy
 import websockets.sync.client
 from cv_bridge import CvBridge
 from openpi_client import image_tools, msgpack_numpy, websocket_client_policy
+from rclpy.exceptions import ParameterUninitializedException
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import Image, JointState
@@ -205,9 +206,9 @@ class OpenPIRTCNode(Node):
 
         self.compliance_ = RobotCompliance(self)
         self._auto_recover = bool(self.get_parameter("auto_error_recovery").value)
-        self._joint_stiffness = list(self.get_parameter("joint_stiffness").value or [])
-        self._collision_torque = list(self.get_parameter("collision_torque").value or [])
-        self._collision_force = list(self.get_parameter("collision_force").value or [])
+        self._joint_stiffness = self._float_list_param("joint_stiffness")
+        self._collision_torque = self._float_list_param("collision_torque")
+        self._collision_force = self._float_list_param("collision_force")
 
         # ── RTC state (cleared on every episode reset) ───────────────────────
         self._prev_actions: np.ndarray | None = None  # verbatim (H, 14) server reply
@@ -231,6 +232,21 @@ class OpenPIRTCNode(Node):
         self._t0: float | None = None
         self._debug_dir = os.path.expanduser("~/Franka/src/franka_openpi/debug/rtc")
         os.makedirs(self._debug_dir, exist_ok=True)
+
+    def _float_list_param(self, name: str) -> list[float]:
+        """Read a double-array parameter, treating an empty override as 'unset'.
+
+        `foo:="[]"` is the documented way to say "leave the robot's current value
+        alone", but an empty YAML list carries no element type, so launch_ros
+        cannot build a DOUBLE_ARRAY from it and passes PARAMETER_NOT_SET instead.
+        get_parameter then raises rather than returning []. Both spellings mean the
+        same thing to the caller, so both collapse to an empty list here.
+        """
+        try:
+            value = self.get_parameter(name).value
+        except ParameterUninitializedException:
+            return []
+        return [float(v) for v in (value or [])]
 
     # ── callbacks ────────────────────────────────────────────────────────
 
