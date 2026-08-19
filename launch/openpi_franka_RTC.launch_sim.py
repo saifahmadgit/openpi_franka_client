@@ -97,6 +97,38 @@ def generate_launch_description():
                 ),
             ),
             DeclareLaunchArgument(
+                "splice_blend_steps",
+                default_value="10",
+                description=(
+                    "Steps over which the residual splice discontinuity is decayed "
+                    "to zero. The server soft-conditions but does not hard-pin the "
+                    "frozen region (~0.02-0.03 rad left over), and that residual is "
+                    "fixed in radians -- so it hurts twice as much every time "
+                    "step_duration is halved. 0 = publish the server chunk verbatim."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "smooth_window",
+                default_value="7",
+                description=(
+                    "Savitzky-Golay window over the chunk's 7 joint columns; 0/1 = off. "
+                    "The policy's chunks zigzag (27% of consecutive per-step deltas "
+                    "reverse sign), and that amplitude is fixed in radians, so the "
+                    "acceleration it implies grows as 1/step_duration^2 -- invisible at "
+                    "0.15 s, felt as vibration at 0.075 s. w=7 cuts p95 zigzag accel "
+                    "4.66 -> 1.02 rad/s^2 for <=36 mrad of path distortion."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "smooth_polyorder",
+                default_value="2",
+                description=(
+                    "Savitzky-Golay polynomial order. 3 preserves the chunk's shape "
+                    "more tightly (max distortion 25 vs 36 mrad) and smooths nearly "
+                    "as well; use it if a grasp needs the curvature intact."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "max_steps",
                 default_value="500",
                 description="Policy steps before the episode is cut off",
@@ -232,6 +264,9 @@ def generate_launch_description():
                         "rtc_d": LaunchConfiguration("rtc_d"),
                         "step_duration": LaunchConfiguration("step_duration"),
                         "send_prev_actions": LaunchConfiguration("send_prev_actions"),
+                        "splice_blend_steps": LaunchConfiguration("splice_blend_steps"),
+                        "smooth_window": LaunchConfiguration("smooth_window"),
+                        "smooth_polyorder": LaunchConfiguration("smooth_polyorder"),
                         "rtc_d_margin": LaunchConfiguration("rtc_d_margin"),
                         "image_size": LaunchConfiguration("image_size"),
                         "max_steps": LaunchConfiguration("max_steps"),

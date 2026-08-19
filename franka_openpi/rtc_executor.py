@@ -41,11 +41,19 @@ _log = rclpy.logging.get_logger("rtc_executor")
 
 TRAJECTORY_TOPIC = "/fer_arm_controller/joint_trajectory"
 
-# Ceiling on how long the catch-up segment may be stretched, in step_durations.
+# Ceiling on how long the catch-up segment may be stretched, in SECONDS.
 # Uncapped, a large tracking error would stall the arm for seconds while it
 # creeps back onto the commanded path; the cap trades a small residual lurch on
 # the worst splices for bounded progress. See _time_parameterize.
-CATCHUP_MAX_STEPS = 4.0
+#
+# Absolute, not a multiple of step_duration. It used to be 4 step_durations,
+# which silently halved the catch-up budget every time step_duration was halved
+# -- exactly backwards, since a faster cadence means MORE tracking error to
+# absorb, not less. Measured at step_duration=0.075: 5 of 16 publishes were
+# pinned at the 4-step cap (300 ms), forcing the catch-up segment above normal
+# speed and putting a lurch on every republish. 0.6 s is what 4 steps meant at
+# the original 0.15 s cadence, so behaviour there is unchanged.
+CATCHUP_MAX_SEC = 0.6
 
 
 def _waypoint_velocities(knots: np.ndarray, times: np.ndarray) -> np.ndarray:
@@ -104,8 +112,8 @@ def _time_parameterize(
     if len(seg) > 1:
         nominal = float(np.median(np.max(np.abs(seg[1:]), axis=1)))
         if nominal > 1e-9:
-            n_steps = min(float(np.max(np.abs(seg[0]))) / nominal, CATCHUP_MAX_STEPS)
-            times[0] = max(times[0], step_duration * n_steps)
+            n_steps = float(np.max(np.abs(seg[0]))) / nominal
+            times[0] = max(times[0], min(step_duration * n_steps, CATCHUP_MAX_SEC))
 
     for _ in range(max_iter):
         vel = _waypoint_velocities(knots, times)

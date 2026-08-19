@@ -35,6 +35,7 @@ from collections import deque
 from typing import Dict, Tuple
 
 import numpy as np
+from scipy.signal import savgol_filter
 import rclpy
 import websockets.sync.client
 from cv_bridge import CvBridge
@@ -143,6 +144,40 @@ class OpenPIRTCNode(Node):
         # Escape hatch: run the streaming loop with no prev_actions on the wire, to
         # separate "streaming fixed it" from "RTC conditioning fixed it".
         self.declare_parameter("send_prev_actions", True)
+        # Steps over which the residual splice discontinuity is decayed to zero.
+        # 0 = off (publish the server's chunk verbatim).
+        #
+        # This exists because the server does NOT hard-pin the frozen region.
+        # Probed directly against 129.105.69.11:8000 with prev_actions_d=18: the
+        # reply carries rtc_active=True, rtc_d_eff=18, rtc_prefix_attention_horizon=38,
+        # and new[0:18] still differs from prev[start:start+18] by up to 0.030 rad
+        # (independent samples differ by 0.083, so the conditioning is working --
+        # it is soft prefix attention over the overlap, not a freeze).
+        #
+        # The residual is a fixed distance in RADIANS, so it does not shrink when
+        # step_duration does: at 0.15 s it is a 0.15 rad/s velocity step, at
+        # 0.075 s the same 0.022 rad becomes 0.30 rad/s and four times the
+        # acceleration -- once per cycle, which is what reads as lost smoothness
+        # at faster cadences. Measured splice jump p50: 0.0226 rad at 0.15,
+        # 0.0219 rad at 0.075. Identical, as expected.
+        self.declare_parameter("splice_blend_steps", 10)
+        # Savitzky-Golay window over the chunk's joint columns; 0 or 1 = off.
+        #
+        # The policy's chunks zigzag at the per-action level: measured over 20
+        # logged chunks, 27% of consecutive per-step deltas reverse sign, with a
+        # second-difference amplitude of p50 7.4 / p95 26 mrad. That is a fixed
+        # amplitude in radians, so the acceleration it implies scales as
+        # 1/step_duration^2 -- harmless at 0.15 s (0.33 rad/s^2), but 4.66 rad/s^2
+        # p95 and 13.0 max at 0.075 s, which exceeds ACC_LIMIT (3.75-10 at
+        # _LIMIT_SCALE=0.5) and is felt as vibration. The measured joints reverse
+        # velocity on 11-23% of samples at that cadence.
+        #
+        # Evaluated on those chunks, w=7/p=2 cuts p95 zigzag accel 4.66 -> 1.02
+        # rad/s^2 for <=36 mrad of worst-case path distortion (p95 9.7 mrad).
+        # w=7/p=3 smooths nearly as well and distorts less (max 25 mrad) if a
+        # grasp needs the shape preserved more tightly.
+        self.declare_parameter("smooth_window", 7)
+        self.declare_parameter("smooth_polyorder", 2)
         # ── compliance ───────────────────────────────────────────────────────
         # The arm is impedance-controlled by libfranka underneath the position
         # interface; these soften it so contact with an obstacle yields instead of
@@ -166,6 +201,9 @@ class OpenPIRTCNode(Node):
         self._rtc_d = int(self.get_parameter("rtc_d").value)
         self._d_margin = int(self.get_parameter("rtc_d_margin").value)
         self._send_prev = bool(self.get_parameter("send_prev_actions").value)
+        self._splice_blend = int(self.get_parameter("splice_blend_steps").value)
+        self._smooth_w = int(self.get_parameter("smooth_window").value)
+        self._smooth_p = int(self.get_parameter("smooth_polyorder").value)
         self._image_size = int(self.get_parameter("image_size").value)
         tag = self.get_parameter("debug_tag").value
         self._debug_prefix = f"{tag}_" if tag else ""
@@ -215,6 +253,7 @@ class OpenPIRTCNode(Node):
         self._chunk_step_times: np.ndarray | None = None
         self._chunk_pub_t: float = 0.0
         self._chunk_offset: int = 0  # index into _prev_actions the publish started at
+        self._rtc_flags_logged: bool = False
 
         # ── diagnostics ──────────────────────────────────────────────────────
         self._rtt_log: list[float] = []
@@ -331,7 +370,8 @@ class OpenPIRTCNode(Node):
         try:
             result = self.policy.infer(obs)
             self._record_timing(result)
-            return np.asarray(result["actions"], dtype=np.float32)
+            self._record_rtc_flags(result)
+            return self._smooth_chunk(np.asarray(result["actions"], dtype=np.float32))
         except Exception as e:
             self.get_logger().error(f"Infer request failed: {e}")
             return None
@@ -352,6 +392,98 @@ class OpenPIRTCNode(Node):
         )
         self._splice_jump_log.append(jump)
         self._splice_meta.append((s_req, s_reply, d_actual, i_old, i_new))
+
+    def _smooth_chunk(self, chunk: np.ndarray) -> np.ndarray:
+        """Savitzky-Golay the 7 joint columns of a chunk; leave everything else.
+
+        Applied to every chunk as it arrives, priming included, so consecutive
+        chunks are filtered identically -- an asymmetry here would show up as a
+        step at the splice, which is the thing _blend_splice then has to absorb.
+
+        Column 7 (gripper) is deliberately NOT filtered: it is thresholded
+        against GRIPPER_CLOSE_THRESHOLD into binary open/close transitions, so
+        smoothing it only moves the crossing instant. Columns 8-13 are padding.
+
+        Runs on the inference worker thread (called from _fetch_chunk_sync), not
+        the asyncio loop.
+        """
+        w, po = self._smooth_w, self._smooth_p
+        if w <= 1 or chunk is None or len(chunk) < 3:
+            return chunk
+        w = min(w, len(chunk))
+        if w % 2 == 0:
+            w -= 1
+        if w <= po:
+            return chunk
+        out = np.array(chunk, dtype=np.float32, copy=True)
+        out[:, :7] = savgol_filter(
+            np.asarray(chunk[:, :7], dtype=float), w, po, axis=0, mode="interp"
+        ).astype(np.float32)
+        return out
+
+    def _blend_splice(
+        self, new_chunk: np.ndarray, s_reply: int, d_actual: int
+    ) -> np.ndarray:
+        """Offset the new chunk so the splice is continuous, then decay the offset.
+
+        new_chunk[d_actual] and prev[s_reply] name the same instant, so their
+        difference is the step change in commanded target the arm sees at the
+        splice. The server leaves ~0.02-0.03 rad of it (see splice_blend_steps).
+        Add that difference back at the splice index and taper it to zero over
+        the next `splice_blend_steps` actions, so the discontinuity is spread
+        across ~0.75 s of motion instead of landing in a single control step.
+
+        Shape-preserving: every action is displaced by the same decaying offset,
+        so the policy's own trajectory through the chunk is untouched -- only the
+        constant that made it disagree with what was already commanded is removed.
+        The gripper column is left alone; it is thresholded, not interpolated.
+        """
+        if self._splice_blend <= 0 or self._prev_actions is None:
+            return new_chunk
+        i_old = int(np.clip(s_reply, 0, len(self._prev_actions) - 1))
+        i_new = int(np.clip(d_actual, 0, len(new_chunk) - 1))
+        delta = np.asarray(self._prev_actions[i_old, :7], dtype=float) - np.asarray(
+            new_chunk[i_new, :7], dtype=float
+        )
+        n = min(self._splice_blend, len(new_chunk) - i_new)
+        if n <= 0 or not np.any(delta):
+            return new_chunk
+        # Raised cosine: 1.0 at the splice (exact continuity with the last
+        # commanded target) falling smoothly to 0. A linear ramp would leave a
+        # slope discontinuity at both ends, which is the same problem one
+        # derivative up.
+        ramp = 0.5 * (1.0 + np.cos(np.pi * np.arange(n) / n))
+        blended = np.array(new_chunk, dtype=np.float32, copy=True)
+        blended[i_new : i_new + n, :7] += (ramp[:, None] * delta[None, :]).astype(
+            np.float32
+        )
+        return blended
+
+    def _record_rtc_flags(self, result: dict):
+        """Log the server's own view of the RTC request, once, on the first reply.
+
+        The reply carries rtc_active / rtc_d_eff / rtc_start / rtc_overlap /
+        rtc_prefix_attention_horizon and nothing here used to read them, so a
+        server silently ignoring prev_actions was indistinguishable from one
+        honouring it. Probed directly, this server sets rtc_active=True and
+        rtc_d_eff equal to the d that was sent, but applies prefix ATTENTION over
+        the overlap rather than pinning: new[0:d] still differs from
+        prev[start:start+d] by up to 0.030 rad (0.083 without conditioning). That
+        is why _blend_splice exists rather than trusting the frozen region.
+        """
+        if self._rtc_flags_logged:
+            return
+        flags = {k: v for k, v in result.items() if k.startswith("rtc_")}
+        if not flags:
+            return
+        self._rtc_flags_logged = True
+        self.get_logger().info(f"Server RTC flags: {flags}")
+        if not flags.get("rtc_active", False) and self._send_prev:
+            self.get_logger().error(
+                "Server reports rtc_active=False despite prev_actions being sent -- "
+                "chunks are independent samples and every splice is a raw "
+                "discontinuity. Check prev_actions_start/d against the server."
+            )
 
     def _record_timing(self, result: dict):
         """Keep server_timing beside policy_timing.
@@ -685,6 +817,14 @@ class OpenPIRTCNode(Node):
                     f"{len(new_chunk)}); replaying its last action only."
                 )
                 d_actual = len(new_chunk) - 1
+
+            # After _measure_splice, so the diagnostics keep recording the RAW
+            # jump the server hands back -- that is the number that tells you
+            # whether RTC conditioning is working. The blended array is what the
+            # arm executes AND what goes back on the wire next cycle: prev_actions
+            # is meant to be the previously *commanded* chunk, and after blending
+            # that is the blended one.
+            new_chunk = self._blend_splice(new_chunk, s_reply, d_actual)
             self._publish(new_chunk, offset=int(d_actual))
 
             # Count what was PLAYED this cycle, not the splice offset. d_actual is
