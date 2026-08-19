@@ -22,6 +22,29 @@ JOINT_NAMES = [
 ]
 
 GRIPPER_CLOSE_THRESHOLD = 0.02
+
+# ── Binary gripper travel + speed ─────────────────────────────────────────────
+# `speed` is the WIDTH rate, not the per-finger rate: commanding 0.1 m/s was
+# measured on hardware as ~50 mm/s at each finger, which is the Franka Hand's
+# rated maximum. So 0.1 is the ceiling worth asking for; higher is clamped.
+#
+# Close used to run at 0.05 while open ran at 0.10, making the close 1.2 s for
+# the same 60 mm of travel the open covered in 0.6 s -- 12 policy steps at
+# step_duration=0.1. Both are 0.1 now.
+#
+# Travel is the other half of the time: the widths below span the full 80 mm
+# stroke, so every open/close pays for 60 mm. Narrowing OPEN_WIDTH to just
+# clear the object cuts both directions proportionally and is usually the
+# bigger win -- 0.065 on a ~50 mm object takes the close to 0.45 s.
+#
+# Raising CLOSE_SPEED does mean meeting the object harder: this path uses Move
+# with adaptive_stop=False, which drives to the target and faults on contact
+# rather than force-limiting. If contact starts tripping the reflex, lower
+# CLOSE_SPEED before anything else.
+GRIPPER_OPEN_WIDTH = 0.08
+GRIPPER_CLOSE_WIDTH = 0.02
+GRIPPER_OPEN_SPEED = 0.1
+GRIPPER_CLOSE_SPEED = 0.1
 STEP_DURATION = 1 / 5  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
 # Actions are delta-based internally (re-integrated by AbsoluteActions), so consecutive
 # targets are spaced assuming the 30 Hz training rate. Executing slower (e.g. 20 Hz)
@@ -109,6 +132,12 @@ class ActionExecutor:
         self._gripper_is_open: bool | None = None
         self._gripper_task: asyncio.Task | None = None
         self._gripper_goal_handle = None
+        # Instance copies so a node can retune them without editing the module
+        # (openpi_rtc_node exposes them as ROS parameters).
+        self.gripper_open_width = GRIPPER_OPEN_WIDTH
+        self.gripper_close_width = GRIPPER_CLOSE_WIDTH
+        self.gripper_open_speed = GRIPPER_OPEN_SPEED
+        self.gripper_close_speed = GRIPPER_CLOSE_SPEED
 
     def wait_for_servers(self, timeout_sec: float = 15.0) -> bool:
         if not self._follow_jt.wait_for_server(timeout_sec=timeout_sec):
@@ -121,14 +150,18 @@ class ActionExecutor:
     async def _send_gripper(self, open_gripper: bool):
         if open_gripper:
             await self._interface.set_gripper_franka(
-                width=0.08, speed=0.1, adaptive_stop=False
+                width=self.gripper_open_width,
+                speed=self.gripper_open_speed,
+                adaptive_stop=False,
             )
         else:
-            # Binary close: clean Move to 4 cm. adaptive_stop=False so it actually
+            # Binary close: clean Move. adaptive_stop=False so it actually
             # reaches the target — adaptive_stop activates for width<=0.01 and cancels
             # the move on any stall, which stops it short of closing.
             await self._interface.set_gripper_franka(
-                width=0.02, speed=0.05, adaptive_stop=False
+                width=self.gripper_close_width,
+                speed=self.gripper_close_speed,
+                adaptive_stop=False,
             )
 
     async def _run_gripper_transitions(self, transitions: list[tuple[float, bool]]):

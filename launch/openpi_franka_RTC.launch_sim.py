@@ -109,23 +109,60 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "smooth_window",
-                default_value="7",
+                default_value="15",
                 description=(
                     "Savitzky-Golay window over the chunk's 7 joint columns; 0/1 = off. "
                     "The policy's chunks zigzag (27% of consecutive per-step deltas "
                     "reverse sign), and that amplitude is fixed in radians, so the "
                     "acceleration it implies grows as 1/step_duration^2 -- invisible at "
-                    "0.15 s, felt as vibration at 0.075 s. w=7 cuts p95 zigzag accel "
-                    "4.66 -> 1.02 rad/s^2 for <=36 mrad of path distortion."
+                    "0.15 s, felt as vibration at 0.075 s. Sized against the band the "
+                    "arm actually executes (indices ~3-8 of 50 at exec_horizon=1), where "
+                    "EE distortion is a flat ~1.4 mm for every window -- the larger "
+                    "figures are at the chunk edges, which are never reached."
                 ),
             ),
             DeclareLaunchArgument(
                 "smooth_polyorder",
-                default_value="2",
+                default_value="3",
                 description=(
-                    "Savitzky-Golay polynomial order. 3 preserves the chunk's shape "
-                    "more tightly (max distortion 25 vs 36 mrad) and smooths nearly "
-                    "as well; use it if a grasp needs the curvature intact."
+                    "Savitzky-Golay polynomial order. With w=15, order 3 gives "
+                    "worst-case zigzag accel 0.91 rad/s^2 (vs 2.05 at w=7/p=2) for "
+                    "1.43 mm p95 EE deviation in the executed band, against 1.39 mm "
+                    "-- 2.3x smoother for 0.04 mm. Drop to w=7/p=2 if a grasp "
+                    "regresses and you want the least-filtered baseline back."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "gripper_open_width",
+                default_value="0.08",
+                description=(
+                    "Gripper aperture when open, m (full stroke is 0.08). Every "
+                    "open/close pays for the travel between this and "
+                    "gripper_close_width, so narrowing it to just clear the object "
+                    "shortens both directions -- usually a bigger win than speed."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "gripper_close_width",
+                default_value="0.02",
+                description="Gripper aperture when closed, m.",
+            ),
+            DeclareLaunchArgument(
+                "gripper_open_speed",
+                default_value="0.1",
+                description=(
+                    "Opening speed, m/s of WIDTH (~half that per finger). 0.1 is the "
+                    "Franka Hand's rated maximum; higher is clamped."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "gripper_close_speed",
+                default_value="0.1",
+                description=(
+                    "Closing speed, m/s of width. Was 0.05, making the close 1.2 s "
+                    "against the open's 0.6 s for identical travel. This path uses "
+                    "Move with adaptive_stop=False, so a faster close meets the "
+                    "object harder -- lower this first if contact trips the reflex."
                 ),
             ),
             DeclareLaunchArgument(
@@ -265,6 +302,10 @@ def generate_launch_description():
                         "step_duration": LaunchConfiguration("step_duration"),
                         "send_prev_actions": LaunchConfiguration("send_prev_actions"),
                         "splice_blend_steps": LaunchConfiguration("splice_blend_steps"),
+                        "gripper_open_width": LaunchConfiguration("gripper_open_width"),
+                        "gripper_close_width": LaunchConfiguration("gripper_close_width"),
+                        "gripper_open_speed": LaunchConfiguration("gripper_open_speed"),
+                        "gripper_close_speed": LaunchConfiguration("gripper_close_speed"),
                         "smooth_window": LaunchConfiguration("smooth_window"),
                         "smooth_polyorder": LaunchConfiguration("smooth_polyorder"),
                         "rtc_d_margin": LaunchConfiguration("rtc_d_margin"),

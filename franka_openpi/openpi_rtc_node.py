@@ -172,12 +172,37 @@ class OpenPIRTCNode(Node):
         # _LIMIT_SCALE=0.5) and is felt as vibration. The measured joints reverse
         # velocity on 11-23% of samples at that cadence.
         #
-        # Evaluated on those chunks, w=7/p=2 cuts p95 zigzag accel 4.66 -> 1.02
-        # rad/s^2 for <=36 mrad of worst-case path distortion (p95 9.7 mrad).
-        # w=7/p=3 smooths nearly as well and distorts less (max 25 mrad) if a
-        # grasp needs the shape preserved more tightly.
-        self.declare_parameter("smooth_window", 7)
-        self.declare_parameter("smooth_polyorder", 2)
+        # Window sizing is governed by WHICH PART OF THE CHUNK IS EXECUTED, not
+        # by the whole chunk. With exec_horizon=1 a chunk is published at
+        # offset=d_actual and replaced d_actual steps later, so only indices
+        # ~[d, 2d] are ever played -- measured d_actual p50 3 / max 7, i.e. a
+        # band around indices 3-8 of 50. Savitzky-Golay's distortion is
+        # concentrated at the array EDGES (mode="interp" polyfits there), and
+        # those indices are never reached. End-effector deviation via Franka FK:
+        #
+        #   filter       zigzag accel max   EE dev whole chunk   EE dev in band
+        #   w=7  p=2          2.05 rad/s^2       4.03 mm max      1.39/1.54 mm
+        #   w=15 p=3          0.91               5.65 mm max      1.43/1.61 mm
+        #   w=21 p=4          0.64               5.59 mm max      1.44/1.62 mm
+        #
+        # The band figure is flat across every window tried, so a wider window
+        # buys smoothness essentially for free. 15/3 takes the 2.3x reduction in
+        # worst-case zigzag and stops there; beyond ~15 the filter spans more
+        # than 1.5 s of a 5 s chunk and starts blunting real motion for a
+        # diminishing return. If exec_horizon is ever raised above ~5, the
+        # executed band moves toward the chunk edges and this must be re-checked.
+        # ── gripper travel + speed ───────────────────────────────────────────
+        # See the constants in action_executor for why these matter and what the
+        # hardware ceiling is. speed is the WIDTH rate; 0.1 m/s is the Franka
+        # Hand's rated maximum and asking for more is clamped. Narrowing
+        # gripper_open_width to just clear the object is the bigger lever, since
+        # it shortens both directions.
+        self.declare_parameter("gripper_open_width", 0.08)
+        self.declare_parameter("gripper_close_width", 0.02)
+        self.declare_parameter("gripper_open_speed", 0.1)
+        self.declare_parameter("gripper_close_speed", 0.1)
+        self.declare_parameter("smooth_window", 15)
+        self.declare_parameter("smooth_polyorder", 3)
         # ── compliance ───────────────────────────────────────────────────────
         # The arm is impedance-controlled by libfranka underneath the position
         # interface; these soften it so contact with an obstacle yields instead of
@@ -240,6 +265,19 @@ class OpenPIRTCNode(Node):
             self,
             step_duration=self._step_duration,
             enforce_limits=bool(self.get_parameter("enforce_limits").value),
+        )
+
+        g = self.executor_._gripper
+        g.gripper_open_width = float(self.get_parameter("gripper_open_width").value)
+        g.gripper_close_width = float(self.get_parameter("gripper_close_width").value)
+        g.gripper_open_speed = float(self.get_parameter("gripper_open_speed").value)
+        g.gripper_close_speed = float(self.get_parameter("gripper_close_speed").value)
+        self.get_logger().info(
+            f"Gripper: open {g.gripper_open_width * 1e3:.0f} mm @ "
+            f"{g.gripper_open_speed * 1e3:.0f} mm/s, close "
+            f"{g.gripper_close_width * 1e3:.0f} mm @ {g.gripper_close_speed * 1e3:.0f} mm/s "
+            f"({abs(g.gripper_open_width - g.gripper_close_width) / g.gripper_close_speed:.2f} s "
+            f"per close)"
         )
 
         self.compliance_ = RobotCompliance(self)
