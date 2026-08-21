@@ -85,6 +85,7 @@ def _time_parameterize(
     q_start: np.ndarray,
     targets: np.ndarray,
     step_duration: float,
+    v_now: np.ndarray | None = None,
     v_max: np.ndarray = VEL_LIMIT,
     a_max: np.ndarray = ACC_LIMIT,
     max_iter: int = 8,
@@ -113,7 +114,31 @@ def _time_parameterize(
         nominal = float(np.median(np.max(np.abs(seg[1:]), axis=1)))
         if nominal > 1e-9:
             n_steps = float(np.max(np.abs(seg[0]))) / nominal
-            times[0] = max(times[0], min(step_duration * n_steps, CATCHUP_MAX_SEC))
+            t_catch = min(step_duration * n_steps, CATCHUP_MAX_SEC)
+            # Never command the catch-up SLOWER than the arm is already moving.
+            #
+            # The rule above sizes segment 0 by distance, at the policy's nominal
+            # speed. But the trajectory is replanned from the measured POSITION
+            # while ignoring the measured VELOCITY, so whenever the arm is moving
+            # faster than nominal -- which it is, because it spends every cycle
+            # catching up -- the new segment 0 asks it to slow down. Measured at
+            # step_duration=0.05: commanded/actual speed p50 0.89, p10 0.58, on
+            # 76% of publishes. That is a brake pulse at the republish rate, and
+            # an event-triggered average over the 1.4 kHz joint log shows it
+            # directly: -0.118 rad/s at t=+60 ms after every publish, peak/SEM
+            # 14.6, ringing out at ~4 Hz. In band terms it is 1.10 mm of EE
+            # motion at 1-3 Hz against 1.99 mm of actual task motion.
+            #
+            # Capping t_catch at the time the gap takes at the CURRENT speed
+            # removes the step. It only ever shortens segment 0, so the vel/accel
+            # iteration below still bounds the result -- this cannot command
+            # motion past VEL_LIMIT/ACC_LIMIT.
+            if v_now is not None:
+                speed = float(np.max(np.abs(np.asarray(v_now, dtype=float))))
+                if speed > 1e-6:
+                    t_at_speed = float(np.max(np.abs(seg[0]))) / speed
+                    t_catch = min(t_catch, max(t_at_speed, step_duration))
+            times[0] = max(times[0], t_catch)
 
     for _ in range(max_iter):
         vel = _waypoint_velocities(knots, times)
@@ -157,7 +182,9 @@ class RTCExecutor:
         )
         return False
 
-    def publish_chunk(self, chunk: np.ndarray, q_start: np.ndarray) -> np.ndarray:
+    def publish_chunk(
+        self, chunk: np.ndarray, q_start: np.ndarray, v_now: np.ndarray | None = None
+    ) -> np.ndarray:
         """Send `chunk` as the trajectory to execute from now, replacing any in flight.
 
         chunk:   (N, >=8) absolute joint targets -- 7 arm + gripper. Only [:, :8]
@@ -175,7 +202,7 @@ class RTCExecutor:
 
         if self._enforce_limits and q_start is not None:
             positions, velocities, times = _time_parameterize(
-                np.asarray(q_start, dtype=float), targets, self._step_duration
+                np.asarray(q_start, dtype=float), targets, self._step_duration, v_now
             )
         else:
             positions = targets

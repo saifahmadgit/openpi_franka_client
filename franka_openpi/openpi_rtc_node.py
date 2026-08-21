@@ -238,6 +238,7 @@ class OpenPIRTCNode(Node):
         self.front2_image = None
         self.wrist_image = None
         self._raw_joints = np.zeros(STATE_DIM)
+        self._raw_vel = np.zeros(STATE_DIM)
 
         self.create_subscription(
             Image, "/camera/front_1/camera/color/image_raw", self._front1_cb, 10
@@ -354,6 +355,21 @@ class OpenPIRTCNode(Node):
         for i, jname in enumerate(JOINT_ORDER):
             if jname in name_to_pos:
                 self._raw_joints[i] = name_to_pos[jname]
+        # Measured velocity, used to keep the catch-up segment from commanding a
+        # speed below the arm's current one (see rtc_executor._time_parameterize).
+        if msg.velocity is not None and len(msg.velocity) == len(msg.name):
+            name_to_vel = dict(zip(msg.name, msg.velocity))
+            for i, jname in enumerate(JOINT_ORDER):
+                if jname in name_to_vel:
+                    self._raw_vel[i] = name_to_vel[jname]
+        # Log at the driver's NATIVE rate, not on a fixed tick. _sample_actual
+        # used to sample every step_duration, so the log's Nyquist frequency
+        # scaled with the cadence being tuned -- at step_duration=0.05 that is
+        # 10 Hz, which aliases away the entire band vibration lives in (10-50 Hz).
+        # Sampling here costs one list append per message and cannot alias.
+        if self._t0 is not None:
+            self._actual_log.append(self._raw_joints[:8].copy())
+            self._actual_time_log.append(time.monotonic() - self._t0)
 
     # ── observation / inference ──────────────────────────────────────────
 
@@ -611,8 +627,9 @@ class OpenPIRTCNode(Node):
         """Publish chunk[offset:] and record the bookkeeping _chunk_index needs."""
         tail = chunk[offset:]
         q_start = self._raw_joints[:7].copy()
+        v_now = self._raw_vel[:7].copy()
         t_pub = time.monotonic()
-        step_times = self.executor_.publish_chunk(tail, q_start=q_start)
+        step_times = self.executor_.publish_chunk(tail, q_start=q_start, v_now=v_now)
         self._prev_actions = chunk
         self._chunk_step_times = step_times
         self._chunk_pub_t = t_pub
@@ -885,11 +902,9 @@ class OpenPIRTCNode(Node):
         dead time. Here nothing is drawn until the run ends.
         """
         while True:
+            # Sampling moved into _joint_cb (native rate, alias-free). This task
+            # is kept alive only so its callers' lifecycle is unchanged.
             await asyncio.sleep(self._step_duration)
-            if self._t0 is None:
-                continue
-            self._actual_log.append(self._raw_joints[:8].copy())
-            self._actual_time_log.append(time.monotonic() - self._t0)
 
     # ── diagnostics ──────────────────────────────────────────────────────
 
