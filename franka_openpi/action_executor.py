@@ -21,7 +21,7 @@ JOINT_NAMES = [
     "fer_joint7",
 ]
 
-GRIPPER_CLOSE_THRESHOLD = 0.02
+GRIPPER_CLOSE_THRESHOLD = 0.03
 
 # ── Binary gripper travel + speed ─────────────────────────────────────────────
 # `speed` is the WIDTH rate, not the per-finger rate: commanding 0.1 m/s was
