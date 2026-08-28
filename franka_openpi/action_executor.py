@@ -21,7 +21,21 @@ JOINT_NAMES = [
     "fer_joint7",
 ]
 
+# Policy gripper column is an absolute finger position in metres, ~0 (closed)
+# to 0.04 (open), mean ~0.025. The threshold is where that ramp gets binarised
+# into an open/close command, so RAISING it fires the close earlier in the
+# policy's ramp-down -- the most direct lever on "the gripper acts late".
 GRIPPER_CLOSE_THRESHOLD = 0.03
+# Schmitt band around the threshold, in the same metres. 0.0 reproduces a plain
+# comparison exactly. Raise it if the policy column dithers across the
+# threshold and the gripper chatters open/closed.
+GRIPPER_HYSTERESIS = 0.0
+# Seconds every transition is pulled EARLIER, to cover the Move action round
+# trip plus finger travel. That cost is fixed in wall clock: it does not shrink
+# when step_duration does, which is why running the policy faster makes the
+# gripper look later relative to the arm rather than earlier. Compensating it
+# here is the only thing that actually moves the grasp instant.
+GRIPPER_LEAD_TIME = 0.0
 
 # ── Binary gripper travel + speed ─────────────────────────────────────────────
 # `speed` is the WIDTH rate, not the per-finger rate: commanding 0.1 m/s was
@@ -42,7 +56,7 @@ GRIPPER_CLOSE_THRESHOLD = 0.03
 # rather than force-limiting. If contact starts tripping the reflex, lower
 # CLOSE_SPEED before anything else.
 GRIPPER_OPEN_WIDTH = 0.08
-GRIPPER_CLOSE_WIDTH = 0.02
+GRIPPER_CLOSE_WIDTH = 0.00
 GRIPPER_OPEN_SPEED = 0.1
 GRIPPER_CLOSE_SPEED = 0.1
 STEP_DURATION = 1 / 5  # seconds per policy step (30 Hz = saifahmad123/Teleop fps).
@@ -138,6 +152,9 @@ class ActionExecutor:
         self.gripper_close_width = GRIPPER_CLOSE_WIDTH
         self.gripper_open_speed = GRIPPER_OPEN_SPEED
         self.gripper_close_speed = GRIPPER_CLOSE_SPEED
+        self.gripper_close_threshold = GRIPPER_CLOSE_THRESHOLD
+        self.gripper_hysteresis = GRIPPER_HYSTERESIS
+        self.gripper_lead_time = GRIPPER_LEAD_TIME
 
     def wait_for_servers(self, timeout_sec: float = 15.0) -> bool:
         if not self._follow_jt.wait_for_server(timeout_sec=timeout_sec):
@@ -164,6 +181,39 @@ class ActionExecutor:
                 adaptive_stop=False,
             )
 
+    def gripper_transitions(self, chunk, step_start) -> list[tuple[float, bool]]:
+        """Binary open/close transition points for `chunk`, timed from publish.
+
+        Shared by both pipelines so the thresholding rule has one definition.
+
+        States are compared against `_gripper_is_open`, which tracks the last
+        state actually SENT to the hardware -- deliberately not the end state of
+        the chunk that scheduled it. Latching the predicted end state at
+        schedule time is wrong whenever the transition can still be cancelled:
+        the next chunk then sees a state the gripper never reached and emits a
+        spurious transition back to where it already was. With exec_horizon=1
+        that happens on every publish, and since `_send_gripper` blocks until
+        the Move completes, the spurious open sits in front of the close the
+        policy actually asked for.
+        """
+        hi = self.gripper_close_threshold + self.gripper_hysteresis
+        lo = self.gripper_close_threshold - self.gripper_hysteresis
+        transitions: list[tuple[float, bool]] = []
+        last_state = self._gripper_is_open
+        for i, action in enumerate(chunk):
+            pos = float(action[7])
+            if last_state is None:
+                gripper_open = pos >= self.gripper_close_threshold
+            elif last_state:
+                gripper_open = pos >= lo  # stay open until it drops below lo
+            else:
+                gripper_open = pos >= hi  # stay closed until it rises above hi
+            if gripper_open != last_state:
+                t = max(0.0, float(step_start[i]) - self.gripper_lead_time)
+                transitions.append((t, gripper_open))
+                last_state = gripper_open
+        return transitions
+
     async def _run_gripper_transitions(self, transitions: list[tuple[float, bool]]):
         """Execute binary open/close transitions timed from chunk start."""
         t0 = asyncio.get_event_loop().time()
@@ -172,6 +222,10 @@ class ActionExecutor:
             if wait > 0:
                 await asyncio.sleep(wait)
             _log.info(f"gripper → {'OPEN' if open_gripper else 'CLOSE'}")
+            # Latch before the await, not after: _send_gripper blocks for the
+            # whole finger travel and a republish cancels this task mid-await,
+            # but by then the goal is already in flight on the hardware.
+            self._gripper_is_open = open_gripper
             await self._send_gripper(open_gripper)
 
     # ── continuous gripper helpers ────────────────────────────────────────────
@@ -321,17 +375,13 @@ class ActionExecutor:
             )
         else:
             # binary: detect open/close transitions and fire at transition points
-            transitions = []
-            last_state = self._gripper_is_open
-            for i, action in enumerate(chunk):
-                gripper_open = float(action[7]) >= GRIPPER_CLOSE_THRESHOLD
-                if gripper_open != last_state:
-                    transitions.append((step_start[i], gripper_open))
-                    last_state = gripper_open
+            transitions = self.gripper_transitions(chunk, step_start)
+            # Cancel unconditionally: an empty list means "no change from here",
+            # so a release still pending from a superseded chunk must not fire.
+            # See rtc_executor._schedule_gripper for what that costs mid-carry.
+            if self._gripper_task and not self._gripper_task.done():
+                self._gripper_task.cancel()
             if transitions:
-                self._gripper_is_open = last_state
-                if self._gripper_task and not self._gripper_task.done():
-                    self._gripper_task.cancel()
                 self._gripper_task = asyncio.create_task(
                     self._run_gripper_transitions(transitions)
                 )

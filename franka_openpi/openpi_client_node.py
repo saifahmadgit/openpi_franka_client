@@ -96,7 +96,11 @@ class OpenPIClientNode(Node):
         self.front1_image = None
         self.front2_image = None  # stays None (unused) in 1-front-camera mode
         self.wrist_image = None
+        # See openpi_rtc_node: zeros is not a safe placeholder here, because the
+        # server re-adds state to its delta prediction and the all-zero pose is
+        # the arm straight up. Gate inference on a real message instead.
         self._raw_joints = np.zeros(STATE_DIM)
+        self._joints_ready = False
 
         self.create_subscription(
             Image, "/camera/front_1/camera/color/image_raw", self._front1_cb, 10
@@ -147,10 +151,14 @@ class OpenPIClientNode(Node):
         for i, jname in enumerate(JOINT_ORDER):
             if jname in name_to_pos:
                 self._raw_joints[i] = name_to_pos[jname]
+        if not self._joints_ready and all(j in name_to_pos for j in JOINT_ORDER[:7]):
+            self._joints_ready = True
 
     # ── observation / inference ──────────────────────────────────────────
 
     def _get_observation(self) -> dict | None:
+        if not self._joints_ready:
+            return None
         if self.front1_image is None or self.wrist_image is None:
             return None
         if self._two_front_cameras and self.front2_image is None:
@@ -350,18 +358,30 @@ class OpenPIClientNode(Node):
         if not ok:
             return
 
-        self.get_logger().info("Waiting for camera images...")
+        self.get_logger().info("Waiting for camera images and joint states...")
         deadline = loop.time() + 10.0
         while (
             self.front1_image is None
             or (self._two_front_cameras and self.front2_image is None)
             or self.wrist_image is None
+            or not self._joints_ready
         ):
             if loop.time() > deadline:
-                self.get_logger().error("Cameras not ready after 10 s — check topics")
+                missing = []
+                if self.front1_image is None:
+                    missing.append("front_1")
+                if self._two_front_cameras and self.front2_image is None:
+                    missing.append("front_2")
+                if self.wrist_image is None:
+                    missing.append("wrist")
+                if not self._joints_ready:
+                    missing.append("/joint_states")
+                self.get_logger().error(
+                    f"Not ready after 10 s — check topics: {', '.join(missing)}"
+                )
                 return
             await asyncio.sleep(0.1)
-        self.get_logger().info("Cameras ready.")
+        self.get_logger().info("Cameras and joint states ready.")
 
         self._init_episode_logs()
 

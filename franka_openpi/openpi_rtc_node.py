@@ -201,6 +201,13 @@ class OpenPIRTCNode(Node):
         self.declare_parameter("gripper_close_width", 0.02)
         self.declare_parameter("gripper_open_speed", 0.1)
         self.declare_parameter("gripper_close_speed", 0.1)
+        # The remaining lateness after travel is fixed wall-clock cost -- Move
+        # round trip plus finger travel -- so it is compensated by scheduling
+        # the transition early, and by binarising the policy ramp sooner.
+        # See the constants in action_executor for both.
+        self.declare_parameter("gripper_lead_time", 0.0)
+        self.declare_parameter("gripper_close_threshold", 0.03)
+        self.declare_parameter("gripper_hysteresis", 0.0)
         self.declare_parameter("smooth_window", 15)
         self.declare_parameter("smooth_polyorder", 3)
         # ── compliance ───────────────────────────────────────────────────────
@@ -237,8 +244,14 @@ class OpenPIRTCNode(Node):
         self.front1_image = None
         self.front2_image = None
         self.wrist_image = None
+        # Zeros are not a safe placeholder for joint state: the server re-adds
+        # the state to its delta prediction, so sending zeros commands the arm to
+        # the all-zero pose -- shoulder vertical, elbow straight, i.e. straight
+        # UP (joint4's limit is [-3.0718, -0.0698], so zero is the extended end).
+        # Nothing may be inferred until a real /joint_states message has landed.
         self._raw_joints = np.zeros(STATE_DIM)
         self._raw_vel = np.zeros(STATE_DIM)
+        self._joints_ready = False
 
         self.create_subscription(
             Image, "/camera/front_1/camera/color/image_raw", self._front1_cb, 10
@@ -273,12 +286,22 @@ class OpenPIRTCNode(Node):
         g.gripper_close_width = float(self.get_parameter("gripper_close_width").value)
         g.gripper_open_speed = float(self.get_parameter("gripper_open_speed").value)
         g.gripper_close_speed = float(self.get_parameter("gripper_close_speed").value)
+        g.gripper_lead_time = float(self.get_parameter("gripper_lead_time").value)
+        g.gripper_close_threshold = float(
+            self.get_parameter("gripper_close_threshold").value
+        )
+        g.gripper_hysteresis = float(self.get_parameter("gripper_hysteresis").value)
         self.get_logger().info(
             f"Gripper: open {g.gripper_open_width * 1e3:.0f} mm @ "
             f"{g.gripper_open_speed * 1e3:.0f} mm/s, close "
             f"{g.gripper_close_width * 1e3:.0f} mm @ {g.gripper_close_speed * 1e3:.0f} mm/s "
             f"({abs(g.gripper_open_width - g.gripper_close_width) / g.gripper_close_speed:.2f} s "
             f"per close)"
+        )
+        self.get_logger().info(
+            f"Gripper trigger: close below {g.gripper_close_threshold:.4f} "
+            f"(+/- {g.gripper_hysteresis:.4f} hysteresis), fired "
+            f"{g.gripper_lead_time:.2f} s early"
         )
 
         self.compliance_ = RobotCompliance(self)
@@ -355,6 +378,10 @@ class OpenPIRTCNode(Node):
         for i, jname in enumerate(JOINT_ORDER):
             if jname in name_to_pos:
                 self._raw_joints[i] = name_to_pos[jname]
+        # Require the 7 arm joints specifically: a message carrying only the
+        # fingers would otherwise mark the arm ready while it is still zeros.
+        if not self._joints_ready and all(j in name_to_pos for j in JOINT_ORDER[:7]):
+            self._joints_ready = True
         # Measured velocity, used to keep the catch-up segment from commanding a
         # speed below the arm's current one (see rtc_executor._time_parameterize).
         if msg.velocity is not None and len(msg.velocity) == len(msg.name):
@@ -379,6 +406,8 @@ class OpenPIRTCNode(Node):
         cam_high <- wrist, cam_left_wrist <- front_1, cam_right_wrist <- front_2
         in 3-cam mode. Do NOT 'fix' by name; this matches how training filled them.
         """
+        if not self._joints_ready:
+            return None
         if self.front1_image is None or self.wrist_image is None:
             return None
         if self._two_front_cameras and self.front2_image is None:
@@ -697,18 +726,34 @@ class OpenPIRTCNode(Node):
             ),
         )
 
-        self.get_logger().info("Waiting for camera images...")
+        # Joint state is waited on HERE rather than left to chance. It used to be
+        # covered only incidentally by how long the cameras take to come up, so a
+        # fast camera start (typically a re-run, with the stream already warm)
+        # could reach the first inference with _raw_joints still zeros.
+        self.get_logger().info("Waiting for camera images and joint states...")
         deadline = loop.time() + 10.0
         while (
             self.front1_image is None
             or (self._two_front_cameras and self.front2_image is None)
             or self.wrist_image is None
+            or not self._joints_ready
         ):
             if loop.time() > deadline:
-                self.get_logger().error("Cameras not ready after 10 s -- check topics")
+                missing = []
+                if self.front1_image is None:
+                    missing.append("front_1")
+                if self._two_front_cameras and self.front2_image is None:
+                    missing.append("front_2")
+                if self.wrist_image is None:
+                    missing.append("wrist")
+                if not self._joints_ready:
+                    missing.append("/joint_states")
+                self.get_logger().error(
+                    f"Not ready after 10 s -- check topics: {', '.join(missing)}"
+                )
                 return
             await asyncio.sleep(0.1)
-        self.get_logger().info("Cameras ready.")
+        self.get_logger().info("Cameras and joint states ready.")
 
         sampler = asyncio.create_task(self._sample_actual())
         try:

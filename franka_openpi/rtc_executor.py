@@ -31,7 +31,6 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from franka_openpi.action_executor import (
     ACC_LIMIT,
     ENFORCE_LIMITS,
-    GRIPPER_CLOSE_THRESHOLD,
     JOINT_NAMES,
     VEL_LIMIT,
     ActionExecutor,
@@ -233,21 +232,23 @@ class RTCExecutor:
         Reuses ActionExecutor's transition runner so gripper behaviour is
         identical across the two pipelines. Any transitions still pending from
         the replaced chunk are cancelled, matching the arm being replaced.
+
+        The cancel happens BEFORE the empty check, and must stay there. A chunk
+        planning the whole task schedules the grasp and the eventual release
+        together; once the grasp has fired, the policy is merely holding and its
+        chunks contain no transitions at all. Returning early on those without
+        cancelling leaves the old release pending, so it fires later and drops
+        the object mid-carry -- while the arm keeps executing a plan that
+        assumes it is still holding. An empty transition list is a positive
+        instruction ("no change from here"), not an absence of information.
         """
         step_start = np.concatenate([[0.0], step_times[:-1]])
-        transitions = []
-        last_state = self._gripper._gripper_is_open
-        for i, action in enumerate(chunk):
-            gripper_open = float(action[7]) >= GRIPPER_CLOSE_THRESHOLD
-            if gripper_open != last_state:
-                transitions.append((float(step_start[i]), gripper_open))
-                last_state = gripper_open
-        if not transitions:
-            return
-        self._gripper._gripper_is_open = last_state
+        transitions = self._gripper.gripper_transitions(chunk, step_start)
         task = self._gripper._gripper_task
         if task and not task.done():
             task.cancel()
+        if not transitions:
+            return
         self._gripper._gripper_task = asyncio.create_task(
             self._gripper._run_gripper_transitions(transitions)
         )

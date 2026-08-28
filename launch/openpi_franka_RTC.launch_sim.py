@@ -166,6 +166,35 @@ def generate_launch_description():
                 ),
             ),
             DeclareLaunchArgument(
+                "gripper_lead_time",
+                default_value="0.0",
+                description=(
+                    "Seconds each open/close is fired EARLIER than the policy asks, "
+                    "to cover the Move round trip plus finger travel. That cost is "
+                    "fixed in wall clock and does not shrink with step_duration, so "
+                    "this is the only knob that moves the grasp instant itself. "
+                    "Start near the measured close time (open_width-close_width)/speed."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "gripper_close_threshold",
+                default_value="0.03",
+                description=(
+                    "Where the policy's gripper column (metres, ~0 closed to 0.04 "
+                    "open) is binarised into a command. RAISING it fires the close "
+                    "earlier in the policy's ramp-down."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "gripper_hysteresis",
+                default_value="0.0",
+                description=(
+                    "Schmitt band around gripper_close_threshold, same metres. 0.0 "
+                    "is a plain comparison. Raise it only if the column dithers "
+                    "across the threshold and the gripper chatters."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "max_steps",
                 default_value="500",
                 description="Policy steps before the episode is cut off",
@@ -306,6 +335,11 @@ def generate_launch_description():
                         "gripper_close_width": LaunchConfiguration("gripper_close_width"),
                         "gripper_open_speed": LaunchConfiguration("gripper_open_speed"),
                         "gripper_close_speed": LaunchConfiguration("gripper_close_speed"),
+                        "gripper_lead_time": LaunchConfiguration("gripper_lead_time"),
+                        "gripper_close_threshold": LaunchConfiguration(
+                            "gripper_close_threshold"
+                        ),
+                        "gripper_hysteresis": LaunchConfiguration("gripper_hysteresis"),
                         "smooth_window": LaunchConfiguration("smooth_window"),
                         "smooth_polyorder": LaunchConfiguration("smooth_polyorder"),
                         "rtc_d_margin": LaunchConfiguration("rtc_d_margin"),
