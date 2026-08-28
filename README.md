@@ -4,6 +4,11 @@ ROS 2 package that runs an [OpenPI](https://github.com/Physical-Intelligence/ope
 policy on a **Franka FER / Panda** arm, with real-time chunking (RTC) so the arm never
 stops between inference calls.
 
+RTC itself is Black, Galliker & Levine, [*Real-Time Execution of Action Chunking Flow
+Policies*](https://arxiv.org/abs/2506.07339) (NeurIPS 2025) — read that for the method.
+This README covers only the deployment: what this client sends, what it expects back, and
+which knobs matter on hardware.
+
 ![Deployment flow](docs/deployment_flow.png)
 
 ## Two pipelines
@@ -69,35 +74,7 @@ source install/setup.bash
 Launch files prepend `~/Franka/.venv/lib/python3.12/site-packages` to `PYTHONPATH`. If
 the workspace or Python version differs, fix `_VENV_SITE` at the top of the launch file.
 
-## How RTC works
-
-From Black, Galliker & Levine, *Real-Time Execution of Action Chunking Flow Policies*.
-Three changes to the naive chunked loop:
-
-1. **Never block on inference.** `rtc_executor` publishes to the controller's topic
-   interface, which is fire-and-forget; JTC replaces whatever is running. The arm keeps
-   playing the current chunk while the request is in flight.
-2. **Fire early.** Request the next chunk at chunk index `s` (`exec_horizon`), not at `H`.
-3. **Condition on what is executing.** Send the previous chunk back with the request,
-   plus the index of the first unexecuted action, so the reply agrees with committed motion.
-
-Given horizon `H`, execution horizon `s`, latency `d`, the new chunk splits into:
-
-```
-[0 ────── d) [d ────────── H-s) [H-s ────── H)
- hard-frozen   soft-masked        free
- pinned to     prefix-attends     unconstrained
- prev chunk    to prev chunk
-```
-
-`_mask_regions()` reports these at end of episode. **If `soft-masked == 0`, RTC is doing
-nothing** — the discontinuity just moves from index 0 to index `d`. That happens at
-`exec_horizon:=0`, kept only for comparison runs. With `exec_horizon:=1`, `H=50`, `d=5`:
-hard 5, soft 44, free 1.
-
-![RTC explained](docs/rtc_explained.png)
-
-### Cycle
+## Control loop
 
 ```
 while steps_done < max_steps:
@@ -112,7 +89,7 @@ A reflex at any point clears RTC state and re-primes. `_chunk_index()` maps wall
 through the executor's `step_times`, not `elapsed / step_duration` — velocity limiting
 stretches segments.
 
-### Server contract
+## Server contract
 
 Sent on every non-priming call, all three together or not at all:
 
@@ -354,7 +331,7 @@ RTC timing
 | Reading | Meaning | Action |
 |---|---|---|
 | `policy_timing` ≪ `server_timing` | expected — `policy_timing` times async JAX dispatch only | none |
-| `soft-masked == 0` | RTC is relocating the discontinuity, not removing it | lower `exec_horizon` |
+| `soft-masked == 0` | nothing is conditioned on the previous chunk (happens at `exec_horizon:=0`), so RTC relocates the discontinuity instead of removing it | lower `exec_horizon` |
 | `splice jump` | step change in commanded target at each handover, on the raw reply — the headline metric | compare before/after server changes |
 | `dropped deadlines > 0` | chunk ran dry with inference in flight; arm holds its last action | raise `rtc_d`, lower `exec_horizon`, or shrink the payload |
 | `frozen-region violations > 0` | spliced inside actions the server never pinned; visible jerk | self-heals via `_d_floor`, but the first is felt |
